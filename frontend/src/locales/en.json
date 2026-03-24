@@ -108,6 +108,7 @@
     "pin_verify_button": "Verify & Send",
     "pin_security_note": "Your PIN is never sent to or stored on our servers"
   },
+  }
   "receive": {
     "title": "Receive Money",
     "subtitle": "Share your wallet address or QR code to receive payments",

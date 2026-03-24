@@ -1,6 +1,7 @@
 const { v4: uuidv4 } = require("uuid");
 const db = require("../db");
 const { sendPayment } = require("../services/stellar");
+const webhook = require("../services/webhook");
 
 // Configurable KYC transaction threshold in USD equivalent
 const KYC_THRESHOLD_USD = parseFloat(process.env.KYC_THRESHOLD_USD || "100");
@@ -87,6 +88,10 @@ async function send(req, res, next) {
       [txId, public_key, recipient_address, amount, asset, memo || null, transactionHash],
     );
 
+    const txData = { id: txId, tx_hash: transactionHash, ledger, amount, asset, sender: public_key, recipient: recipient_address };
+    webhook.deliver('payment.sent', txData).catch(() => {});
+    webhook.deliver('payment.received', txData).catch(() => {});
+
     res.json({
       message: "Payment sent successfully",
       transaction: {
@@ -100,10 +105,12 @@ async function send(req, res, next) {
     });
   } catch (err) {
     if (err.status === 400 || err.status === 500) {
+      webhook.deliver('payment.failed', { error: err.message }).catch(() => {});
       return res.status(err.status).json({ error: err.message });
     }
     if (err.response?.data) {
       const extras = err.response.data?.extras;
+      webhook.deliver('payment.failed', { error: 'Transaction failed', details: extras }).catch(() => {});
       return res.status(400).json({ error: "Transaction failed", details: extras });
     }
     next(err);
@@ -112,6 +119,10 @@ async function send(req, res, next) {
 
 async function history(req, res, next) {
   try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+
     const walletResult = await db.query(
       "SELECT public_key FROM wallets WHERE user_id = $1",
       [req.user.userId],
@@ -119,20 +130,34 @@ async function history(req, res, next) {
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
     const { public_key } = walletResult.rows[0];
-    const result = await db.query(
-      `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, created_at
-       FROM transactions
-       WHERE sender_wallet = $1 OR recipient_wallet = $1
-       ORDER BY created_at DESC LIMIT 50`,
-      [public_key],
-    );
 
+    const [countResult, result] = await Promise.all([
+      db.query(
+        `SELECT COUNT(*) FROM transactions WHERE sender_wallet = $1 OR recipient_wallet = $1`,
+        [public_key],
+      ),
+      db.query(
+        `SELECT id, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status, created_at
+         FROM transactions
+         WHERE sender_wallet = $1 OR recipient_wallet = $1
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+        [public_key, limit, offset],
+      ),
+    ]);
+
+    const total = parseInt(countResult.rows[0].count);
     const transactions = result.rows.map((tx) => ({
       ...tx,
       direction: tx.sender_wallet === public_key ? "sent" : "received",
     }));
 
-    res.json({ transactions });
+    res.json({
+      transactions,
+      total,
+      page,
+      limit,
+      pages: Math.ceil(total / limit),
+    });
   } catch (err) {
     next(err);
   }

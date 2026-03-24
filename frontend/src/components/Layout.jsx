@@ -1,6 +1,6 @@
 import React from 'react';
 import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, Send, Download, Clock, User, LogOut } from 'lucide-react';
+import { LayoutDashboard, Send, Download, Clock, User, LogOut, Webhook } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 
 const navItems = [
@@ -8,8 +8,11 @@ const navItems = [
   { to: '/send', icon: Send, label: 'Send' },
   { to: '/receive', icon: Download, label: 'Receive' },
   { to: '/history', icon: Clock, label: 'History' },
+  { to: '/webhooks', icon: Webhook, label: 'Webhooks' },
   { to: '/profile', icon: User, label: 'Profile' },
 ];
+
+const isTestnet = process.env.REACT_APP_STELLAR_NETWORK !== 'mainnet';
 
 export default function Layout() {
   const { logout } = useAuth();
@@ -19,6 +22,11 @@ export default function Layout() {
 
   return (
     <div className="min-h-screen bg-gray-950 flex flex-col">
+      {isTestnet && (
+        <div className="bg-yellow-400 text-yellow-900 text-center text-xs font-semibold py-1">
+          ⚠️ TESTNET — Do not use real funds
+        </div>
+      )}
       {/* Top bar */}
       <header className="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-2">
