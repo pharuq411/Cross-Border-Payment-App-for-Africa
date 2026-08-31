@@ -8,8 +8,6 @@ const logger = require('../utils/logger');
 const { hashPIN, comparePIN, validatePIN } = require('../services/pin');
 const { sendVerificationEmail, sendPasswordResetEmail, sendBackupCodeWarningEmail } = require('../services/email');
 const { generateSecret, verifyToken, generateBackupCodes, useBackupCode, hashBackupCode, verifyBackupCode } = require('../services/twofa');
-const { sendVerificationEmail, sendPasswordResetEmail } = require('../services/email');
-const { generateSecret, verifyToken, generateBackupCodes } = require('../services/twofa');
 const {
   COOKIE_NAME,
   COOKIE_OPTIONS,
@@ -24,8 +22,8 @@ const cache = require('../utils/cache');
 
 const { sendOTP } = require('../services/sms');
 const { recordSession, invalidateOtherSessions } = require('./sessionController');
-const { recordSession } = require('./sessionController');
 
+const TOKEN_TTL_MS = 96 * 60 * 60 * 1000; // 96 hours
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const PHONE_OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -170,12 +168,12 @@ async function register(req, res, next) {
 async function login(req, res, next) {
   try {
     const { email, password, totp_code, rememberDevice } = req.body;
-    const incomingDeviceToken = req.headers['x-device-token'];
+    const incomingDeviceToken = req.headers?.['x-device-token'];
 
     const result = await db.query(
       `SELECT u.id, u.full_name, u.email, u.password_hash, u.email_verified, u.role,
               u.totp_enabled, u.totp_secret, u.failed_login_attempts, u.locked_until,
-              u.last_failed_attempt_at, w.public_key
+              u.last_failed_attempt_at, u.onboarding_completed, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.email = $1`,
       [email]
@@ -255,10 +253,8 @@ async function login(req, res, next) {
     // Check if 2FA is enabled
     if (user.totp_enabled) {
       const { totp_code: totpCode, backup_code } = req.body;
-      if (!totpCode && !backup_code) {
-        return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
-      }
 
+      // Backup codes can be used in place of TOTP
       if (backup_code) {
         const codes = await db.query(
           `SELECT id, code_hash FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
@@ -284,25 +280,23 @@ async function login(req, res, next) {
           sendBackupCodeWarningEmail(emailRow.rows[0].email, parseInt(remaining.rows[0].count, 10)).catch(() => {});
         }
       } else {
-        if (!verifyToken(user.totp_secret, totpCode)) {
-    // 2FA check — must happen before issuing tokens
-    if (user.totp_enabled) {
-      // Check if the incoming device trust token allows skipping TOTP
-      let deviceTrusted = false;
-      if (incomingDeviceToken) {
-        try {
-          const payload = verifyDeviceToken(incomingDeviceToken);
-          deviceTrusted = String(payload.userId) === String(user.id);
-        } catch { /* expired or invalid — fall through to TOTP */ }
-      }
-
-      if (!deviceTrusted) {
-        if (!totp_code) {
-          return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
+        // Check if the incoming device trust token allows skipping TOTP
+        let deviceTrusted = false;
+        if (incomingDeviceToken) {
+          try {
+            const payload = verifyDeviceToken(incomingDeviceToken);
+            deviceTrusted = String(payload.userId) === String(user.id);
+          } catch { /* expired or invalid — fall through to TOTP */ }
         }
-        const isValid = verifyToken(user.totp_secret, totp_code);
-        if (!isValid) {
-          return res.status(401).json({ error: 'Invalid TOTP code' });
+
+        if (!deviceTrusted) {
+          if (!totpCode) {
+            return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
+          }
+          const isValid = verifyToken(user.totp_secret, totpCode);
+          if (!isValid) {
+            return res.status(401).json({ error: 'Invalid TOTP code' });
+          }
         }
       }
     }
@@ -343,6 +337,7 @@ async function login(req, res, next) {
         email: user.email,
         wallet_address: user.public_key,
         phone_verified: user.phone_verified,
+        onboarding_completed: user.onboarding_completed,
       },
       ...(device_token && { device_token }),
     });
@@ -444,7 +439,7 @@ async function verifyPhone(req, res, next) {
 async function getMe(req, res, next) {
   try {
     const result = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, u.avatar_url, w.public_key
+      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, u.avatar_url, u.onboarding_completed, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.id = $1`,
       [req.user.userId]
@@ -463,6 +458,7 @@ async function getMe(req, res, next) {
       totp_enabled: u.totp_enabled,
       account_type: u.account_type,
       avatar_url: u.avatar_url || null,
+      onboarding_completed: u.onboarding_completed,
     });
   } catch (err) {
     next(err);
@@ -964,6 +960,17 @@ async function getActivity(req, res, next) {
   }
 }
 
+async function completeOnboarding(req, res, next) {
+  try {
+    const userId = req.user.userId;
+    await db.query('UPDATE users SET onboarding_completed = TRUE WHERE id = $1', [userId]);
+    audit.log(userId, 'onboarding_completed', req.ip, req.headers['user-agent']);
+    res.json({ message: 'Onboarding completed' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function changePassword(req, res, next) {
   try {
     const { current_password, new_password } = req.body;
@@ -987,6 +994,11 @@ async function changePassword(req, res, next) {
 
     audit.log(userId, 'password_change', req.ip, req.headers['user-agent']);
     res.json({ message: 'Password changed successfully' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // Magic-bytes signatures for allowed image types
 const IMAGE_MAGIC = [
   { mime: 'image/jpeg', bytes: [0xff, 0xd8, 0xff] },
@@ -1038,7 +1050,6 @@ async function uploadAvatar(req, res, next) {
   }
 }
 
-module.exports = { register, login, verifyEmail, getMe, setPIN, verifyPIN };
 module.exports = {
   register,
   login,
@@ -1063,4 +1074,5 @@ module.exports = {
   getBackupCodeCount,
   changePassword,
   validateResetToken,
+  completeOnboarding,
 };
