@@ -942,3 +942,174 @@ fn test_deposit_emits_escrow_deposited_event() {
     assert_eq!(payload.amount, deposit_amount);
     assert_eq!(payload.new_total, amount + deposit_amount);
 }
+
+// ── escrow → dispute-resolution cross-contract hook ───────────────────────────
+
+/// Register both the escrow and dispute-resolution contracts in the same Env,
+/// wire them together (escrow → dispute hook + dispute → trusted escrow), and
+/// return the handles needed by the integration tests.
+fn setup_with_dispute() -> (
+    Env,
+    EscrowContractClient<'static>,
+    Address, // escrow contract id
+    Address, // dispute-resolution contract id
+    Address, // admin
+    Address, // usdc_id
+) {
+    use dispute_resolution_contract::{DisputeResolutionContract, DisputeResolutionContractClient};
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let escrow_contract_id = env.register_contract(None, EscrowContract);
+    let escrow_client = EscrowContractClient::new(&env, &escrow_contract_id);
+
+    let dispute_resolution_id = env.register_contract(None, DisputeResolutionContract);
+    let dispute_client = DisputeResolutionContractClient::new(&env, &dispute_resolution_id);
+
+    let admin = Address::generate(&env);
+    let usdc_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    escrow_client.initialize(&admin, &usdc_id);
+    escrow_client.set_dispute_contract(&admin, &dispute_resolution_id);
+
+    let arbitrator = Address::generate(&env);
+    dispute_client.initialize(&admin, &arbitrator, &usdc_id, &256u32, &admin);
+    dispute_client.set_escrow_contract(&admin, &escrow_contract_id);
+
+    (
+        env,
+        escrow_client,
+        escrow_contract_id,
+        dispute_resolution_id,
+        admin,
+        usdc_id,
+    )
+}
+
+#[test]
+fn test_dispute_escrow_hands_funds_to_dispute_resolution() {
+    use dispute_resolution_contract::DisputeResolutionContractClient;
+
+    let (env, escrow, escrow_contract_id, dispute_resolution_id, admin, usdc_id) =
+        setup_with_dispute();
+    let dispute = DisputeResolutionContractClient::new(&env, &dispute_resolution_id);
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    // Agent confirms delivery, which blocks the sender from cancelling.
+    escrow.confirm_delivery(&agent, &escrow_id);
+
+    // Sender's recourse: escalate the confirmed-but-unreleased escrow.
+    let dispute_id = escrow.dispute_escrow(&sender, &escrow_id);
+
+    assert_eq!(
+        escrow.get_escrow(&escrow_id).status,
+        EscrowStatus::UnderDispute
+    );
+
+    // Full balance leaves escrow custody and now sits with the arbiter.
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&escrow_contract_id), 0);
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&dispute_resolution_id),
+        amount
+    );
+
+    let d = dispute.get_dispute(&dispute_id);
+    assert_eq!(d.sender, sender);
+    assert_eq!(d.recipient, recipient);
+    assert_eq!(d.amount, amount);
+}
+
+#[test]
+fn test_dispute_escrow_by_recipient() {
+    let (env, escrow, escrow_contract_id, dispute_resolution_id, admin, usdc_id) =
+        setup_with_dispute();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    escrow.dispute_escrow(&recipient, &escrow_id);
+
+    assert_eq!(
+        escrow.get_escrow(&escrow_id).status,
+        EscrowStatus::UnderDispute
+    );
+    assert_eq!(TokenClient::new(&env, &usdc_id).balance(&escrow_contract_id), 0);
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&dispute_resolution_id),
+        amount
+    );
+}
+
+#[test]
+fn test_disputed_escrow_cannot_be_cancelled_or_released() {
+    let (env, escrow, _, _, admin, usdc_id) = setup_with_dispute();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    escrow.confirm_delivery(&agent, &escrow_id);
+    escrow.dispute_escrow(&sender, &escrow_id);
+
+    let cancel_err = std::panic::catch_unwind(|| escrow.cancel_escrow(&sender, &escrow_id));
+    assert!(cancel_err.is_err());
+    assert!(format!("{:?}", cancel_err.err().unwrap())
+        .contains("Escrow is not in pending state"));
+
+    let release_err = std::panic::catch_unwind(|| escrow.release_escrow(&agent, &escrow_id));
+    assert!(release_err.is_err());
+    assert!(format!("{:?}", release_err.err().unwrap())
+        .contains("Escrow is not in pending state"));
+}
+
+#[test]
+#[should_panic(expected = "Only the sender or recipient can dispute escrow")]
+fn test_dispute_escrow_third_party_panics() {
+    let (env, escrow, _, _, admin, usdc_id) = setup_with_dispute();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let outsider = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = escrow.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    escrow.dispute_escrow(&outsider, &escrow_id);
+}
+
+#[test]
+#[should_panic(expected = "Dispute resolution contract not configured")]
+fn test_dispute_escrow_unconfigured_panics() {
+    let (env, client, admin, usdc_id) = setup();
+
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let amount = 1_000_0000000i128;
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, amount);
+
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &amount, &250);
+    client.dispute_escrow(&sender, &escrow_id);
+}
