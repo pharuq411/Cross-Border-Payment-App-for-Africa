@@ -405,9 +405,15 @@ export default function Profile() {
     navigate('/');
   };
 
-  const changeLanguage = (code) => {
+  const changeLanguage = async (code) => {
     i18n.changeLanguage(code);
     localStorage.setItem('afripay_lang', code);
+    try {
+      await api.patch('/auth/me', { preferred_language: code });
+    } catch {
+      // Non-critical: local preference is already applied; backend sync failure
+      // is silently ignored to avoid disrupting the language-switch UX.
+    }
   };
 
   const addContact = async (e) => {
