@@ -20,11 +20,12 @@ pub enum DataKey {
     FeeBps,
     Schedule(u64),
     Counter,
-    /// Maximum consecutive misses allowed before a schedule is auto-cancelled.
-    /// Stored globally; overridable per schedule via RecurringSchedule::max_missed_executions.
     MaxMissedExecutions,
-    /// Tracks the total consecutive missed-execution count for a given schedule ID.
     MissedExecutions(u64),
+    /// Vec<u64> of schedule IDs for a given sender address.
+    UserSchedules(Address),
+    /// Global schedule count for full enumeration.
+    TotalSchedules,
 }
 
 // ── Data types ────────────────────────────────────────────────────────────────
@@ -103,13 +104,15 @@ pub struct ScheduleCancelled {
 #[derive(Clone)]
 #[contracttype]
 pub struct SchedulePaused {
-    pub id: u64,
+    pub schedule_id: u64,
+    pub paused_at: u64,
 }
 
 #[derive(Clone)]
 #[contracttype]
 pub struct ScheduleResumed {
-    pub id: u64,
+    pub schedule_id: u64,
+    pub next_payment_at: u64,
 }
 
 #[derive(Clone)]
@@ -204,6 +207,9 @@ impl RecurringPaymentsContract {
         if interval == 0 {
             panic!("interval must be > 0");
         }
+        if max_executions == u64::MAX {
+            panic!("Invalid max_executions");
+        }
 
         sender.require_auth();
 
@@ -241,6 +247,30 @@ impl RecurringPaymentsContract {
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(id), &schedule);
+
+        // Update UserSchedules for the sender (bounded to 500 per sender).
+        let mut user_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSchedules(sender.clone()))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        if user_ids.len() >= 500 {
+            panic!("Schedule limit per sender reached");
+        }
+        user_ids.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserSchedules(sender.clone()), &user_ids);
+
+        // Increment global TotalSchedules counter.
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalSchedules)
+            .unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalSchedules, &(total + 1));
 
         // Initialise the missed-executions counter for this schedule ID.
         env.storage()
@@ -308,6 +338,9 @@ impl RecurringPaymentsContract {
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found");
 
+        if schedule.status == ScheduleStatus::Paused {
+            panic!("Schedule is paused");
+        }
         if schedule.status != ScheduleStatus::Active {
             panic!("schedule is not active");
         }
@@ -477,18 +510,28 @@ impl RecurringPaymentsContract {
         if schedule.sender != sender {
             panic!("only the sender can pause");
         }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("schedule is cancelled");
+        }
+        if schedule.status == ScheduleStatus::Paused {
+            panic!("schedule is already paused");
+        }
         if schedule.status != ScheduleStatus::Active {
             panic!("schedule is not active");
         }
 
         schedule.status = ScheduleStatus::Paused;
+        let paused_at = env.ledger().timestamp();
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(schedule_id), &schedule);
 
         env.events().publish(
             (Symbol::new(&env, "SchedulePaused"),),
-            SchedulePaused { id: schedule_id },
+            SchedulePaused {
+                schedule_id,
+                paused_at,
+            },
         );
     }
 
@@ -505,18 +548,26 @@ impl RecurringPaymentsContract {
         if schedule.sender != sender {
             panic!("only the sender can resume");
         }
+        if schedule.status == ScheduleStatus::Cancelled {
+            panic!("schedule is cancelled");
+        }
         if schedule.status != ScheduleStatus::Paused {
             panic!("schedule is not paused");
         }
 
+        let next_payment_at = env.ledger().timestamp() + schedule.interval;
         schedule.status = ScheduleStatus::Active;
+        schedule.next_payment_at = next_payment_at;
         env.storage()
             .persistent()
             .set(&DataKey::Schedule(schedule_id), &schedule);
 
         env.events().publish(
             (Symbol::new(&env, "ScheduleResumed"),),
-            ScheduleResumed { id: schedule_id },
+            ScheduleResumed {
+                schedule_id,
+                next_payment_at,
+            },
         );
     }
 
@@ -527,17 +578,17 @@ impl RecurringPaymentsContract {
     }
 
     /// Read a schedule by ID.
-    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
+    pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
         env.storage()
             .persistent()
             .get(&DataKey::Schedule(schedule_id))
             .expect("schedule not found")
     }
 
-    /// Deprecated alias for get_recurring_payment. Use get_recurring_payment instead.
+    /// Deprecated alias for get_schedule. Use get_schedule instead.
     #[deprecated]
-    pub fn get_schedule(env: Env, schedule_id: u64) -> RecurringSchedule {
-        Self::get_recurring_payment(env, schedule_id)
+    pub fn get_recurring_payment(env: Env, schedule_id: u64) -> RecurringSchedule {
+        Self::get_schedule(env, schedule_id)
     }
 
     /// Update the payment amount for a recurring schedule. Only the sender may update.
@@ -612,6 +663,8 @@ impl RecurringPaymentsContract {
                 updated_by: sender,
             },
         );
+    }
+
     /// Return the current consecutive missed-execution count for a schedule.
     pub fn get_missed_executions(env: Env, schedule_id: u64) -> u64 {
         env.storage()
@@ -620,7 +673,80 @@ impl RecurringPaymentsContract {
             .unwrap_or(0)
     }
 
+    /// Return the remaining executions for a schedule.
+    /// Returns None for unlimited schedules (max_executions = 0).
+    /// Returns Some(remaining) for bounded schedules.
+    pub fn get_remaining_executions(env: Env, schedule_id: u64) -> Option<u64> {
+        let schedule: RecurringSchedule = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found");
+        if schedule.max_executions == 0 {
+            None
+        } else if schedule.executions_completed >= schedule.max_executions {
+            Some(0)
+        } else {
+            Some(schedule.max_executions - schedule.executions_completed)
+        }
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
+
+    /// Returns paginated schedule IDs for a given sender. Limit capped at 50.
+    pub fn get_user_schedules(env: Env, sender: Address, start: u32, limit: u32) -> soroban_sdk::Vec<u64> {
+        let cap = if limit > 50 { 50 } else { limit };
+        let ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserSchedules(sender))
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let len = ids.len();
+        let mut i = start;
+        while i < len && (i - start) < cap {
+            result.push_back(ids.get(i).unwrap());
+            i += 1;
+        }
+        result
+    }
+
+    /// Returns the full schedule struct for a given ID.
+    pub fn get_schedule_by_id(env: Env, schedule_id: u64) -> RecurringSchedule {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Schedule(schedule_id))
+            .expect("schedule not found")
+    }
+
+    /// Returns paginated IDs of schedules with Active status. Limit capped at 50.
+    pub fn get_active_schedules(env: Env, start: u64, limit: u64) -> soroban_sdk::Vec<u64> {
+        let cap = if limit > 50 { 50 } else { limit };
+        let total: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalSchedules)
+            .unwrap_or(0);
+        let mut result: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+        let mut scanned: u64 = 0;
+        let mut id: u64 = 1;
+        while id <= total && scanned < start + cap {
+            if let Some(s) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, RecurringSchedule>(&DataKey::Schedule(id))
+            {
+                if s.status == ScheduleStatus::Active {
+                    if scanned >= start {
+                        result.push_back(id);
+                    }
+                    scanned += 1;
+                }
+            }
+            id += 1;
+        }
+        result
+    }
 
     fn next_id(env: &Env) -> u64 {
         let current: u64 = env

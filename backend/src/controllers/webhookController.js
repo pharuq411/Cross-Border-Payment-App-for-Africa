@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const db = require('../db');
+const { validatePublicUrl } = require('../utils/ssrf');
 const { validatePublicUrl } = require('../utils/ssrfValidator');
 const { validateOutboundUrl } = require('../utils/ssrf');
 const { encryptSecret, decryptSecret } = require('../utils/symmetricEncryption');
@@ -9,6 +10,17 @@ const VALID_EVENTS = ['payment.sent', 'payment.received', 'payment.failed'];
 async function create(req, res, next) {
   try {
     const { url, events } = req.body;
+
+    // Webhook endpoints must be HTTPS to protect the HMAC secret in transit
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(url);
+    } catch {
+      return res.status(400).json({ error: 'Invalid URL format' });
+    }
+    if (parsedUrl.protocol !== 'https:') {
+      return res.status(400).json({ error: 'Webhook URL must use HTTPS' });
+    }
 
     const ssrfCheck = await validateOutboundUrl(url);
     if (!ssrfCheck.valid) {
@@ -91,6 +103,45 @@ async function listDeliveries(req, res, next) {
   }
 }
 
+const ROTATION_OVERLAP_HOURS = parseInt(process.env.WEBHOOK_SECRET_ROTATION_OVERLAP_HOURS || '24', 10);
+
+/**
+ * POST /api/webhooks/:id/rotate-secret
+ * Issues a new signing secret while keeping the old one valid for a grace
+ * window, so in-flight deliveries and not-yet-updated verifiers don't break.
+ */
+async function rotateSecret(req, res, next) {
+  try {
+    const { id } = req.params;
+
+    const { rows } = await db.query(
+      `SELECT id, secret FROM webhooks WHERE id = $1 AND user_id = $2`,
+      [id, req.user.userId]
+    );
+    if (!rows.length) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const newPlainSecret = crypto.randomBytes(32).toString('hex');
+    const newEncryptedSecret = encryptSecret(newPlainSecret);
+
+    const { rows: updated } = await db.query(
+      `UPDATE webhooks
+          SET secret = $1,
+              previous_secret = $2,
+              previous_secret_expires_at = NOW() + ($3 || ' hours')::interval
+        WHERE id = $4
+        RETURNING id, url, events, active, created_at, previous_secret_expires_at`,
+      [newEncryptedSecret, rows[0].secret, ROTATION_OVERLAP_HOURS, id]
+    );
+
+    // Return the plain secret once — it will not be shown again
+    res.json({ ...updated[0], secret: newPlainSecret });
+  } catch (err) {
+    next(err);
+  }
+}
+
 async function retry(req, res, next) {
   try {
     const { id } = req.params;
@@ -111,6 +162,7 @@ async function retry(req, res, next) {
   }
 }
 
+module.exports = { create, list, listDeliveries, retry, rotateSecret };
 async function update(req, res, next) {
   try {
     const { id } = req.params;

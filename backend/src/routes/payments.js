@@ -1,5 +1,4 @@
 const router = require("express").Router();
-﻿const router = require("express").Router();
 const { body, query, validationResult } = require("express-validator");
 const rateLimit = require("express-rate-limit");
 const StellarSdk = require("@stellar/stellar-sdk");
@@ -70,6 +69,38 @@ router.get("/fee-stats", getFeeStats);
 router.get("/fee-rate", getFeeRate);
 
 /**
+ * @openapi
+ * /api/payments/send:
+ *   post:
+ *     summary: Send a payment
+ *     description: >
+ *       Request schema is generated from the same express-validator chains
+ *       enforced at runtime (see validators/paymentSendValidators.js), so
+ *       these docs cannot drift from actual validation behavior.
+ *     tags: [Payments]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         schema:
+ *           type: string
+ *         description: Prevents duplicate payments on client retry.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/PaymentSendRequest'
+ *     responses:
+ *       200:
+ *         description: Payment submitted
+ *       400:
+ *         description: Validation error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  * POST /api/payments/send
  * @protected @idempotent
  * Idempotency-Key header prevents duplicate payments on client retry.
@@ -111,26 +142,6 @@ router.get(
     }
   },
 );
-
-/**
- * POST /api/payments/send
- * @protected @idempotent
- * Idempotency-Key header prevents duplicate payments on client retry.
- * Closes #492
- */
-router.post(
-  "/send",
-  paymentSendValidators,
-  validate,
-  idempotency,
-  send,
-);
-
-/**
- * POST /api/payments/batch
- * @protected @idempotent
- */
-router.post("/batch", paymentBatchValidators, validate, idempotency, sendBatch);
 
 /**
  * @swagger

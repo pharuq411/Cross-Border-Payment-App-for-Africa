@@ -1,6 +1,4 @@
 const { v4: uuidv4 } = require("uuid");
-const { stringify } = require("csv-stringify/sync");
-const { stringify: csvStream } = require("csv-stringify");
 const { stringify: stringifySync } = require("csv-stringify/sync");
 const { stringify: stringifyStream } = require("csv-stringify");
 const db = require("../db");
@@ -19,16 +17,14 @@ const {
 } = require("../services/stellar");
 const webhook = require("../services/webhook");
 const cache = require("../utils/cache");
-<<<<<<< rss
 const { sendTransactionEmail, enqueueEmail } = require("../services/email");
-=======
-const { sendTransactionEmail } = require("../services/email");
 const { persistAndBroadcast } = require("../services/notificationInbox");
->>>>>>> main
-const { checkVelocity, checkDailyLimit } = require("../services/fraudDetection");
-const { checkFraud, logFraudBlock } = require("../services/fraudDetection");
+const { checkVelocity, checkDailyLimit, checkFraud, logFraudBlock } = require("../services/fraudDetection");
+const { withLock } = require("../utils/distributedLock");
 const { parseHistoryFrom, parseHistoryTo, normalizeAsset, validateDateRange } = require("../utils/historyQuery");
 const { isMemoRequired } = require("../services/memoRequired");
+const { awardReferralCredit } = require("./referralController");
+const { enqueueMint } = require("../services/loyaltyMintQueue");
 const { creditReferralReward } = require("../services/referralRewardService");
 const { enqueueLoyaltyMint } = require("../jobs/loyaltyMintJob");
 const { depositFee } = require("../services/feeDistributor");
@@ -36,6 +32,7 @@ const { getActiveConfig } = require("../services/feeConfigService");
 const logger = require("../utils/logger");
 const { cancelEscrow } = require("../services/agentEscrow");
 const audit = require("../services/audit");
+const { amlRescreenForPayment } = require("./kycController");
 
 const KYC_THRESHOLD_USD = parseFloat(process.env.KYC_THRESHOLD_USD || "100");
 
@@ -204,7 +201,8 @@ async function estimateFee(req, res, next) {
 
 /**
  * GET /api/payments/estimate-fees?amount=100&asset=USDC
- * Returns a pre-submission fee breakdown without processing a payment.
+ * Queries fee rate from fee-distributor contract via Horizon simulate (read-only).
+ * Falls back to Redis cache, then PLATFORM_FEE_BPS env var.
  */
 async function estimateFees(req, res, next) {
   try {
@@ -216,10 +214,65 @@ async function estimateFees(req, res, next) {
     if (!VALID.includes(asset)) {
       return res.status(400).json({ error: `asset must be one of: ${VALID.join(", ")}` });
     }
+
+    const CACHE_KEY = 'fee_rate_bps_onchain';
+    const CACHE_TTL = 60; // 60-second TTL per issue #765
+    let feeBps = null;
+    let feeRateSource = 'on-chain';
+    let lastFetchedAt = new Date().toISOString();
+
+    // 1. Try on-chain via Horizon simulate
+    try {
+      const contractId = process.env.FEE_DISTRIBUTOR_CONTRACT_ID;
+      if (contractId) {
+        const axios = require('axios');
+        const horizonUrl = process.env.STELLAR_HORIZON_URL || 'https://horizon-testnet.stellar.org';
+        const { data } = await axios.post(`${horizonUrl}/simulate_transaction`, {
+          contract_id: contractId,
+          function_name: 'get_fee_rate',
+          args: [],
+        }, { timeout: 5000 });
+        const onChainBps = data?.result ?? data?.return_value;
+        if (onChainBps != null) {
+          feeBps = parseInt(onChainBps, 10);
+          await cache.set(CACHE_KEY, feeBps, CACHE_TTL);
+          lastFetchedAt = new Date().toISOString();
+        }
+      }
+    } catch (_) {
+      feeRateSource = 'cached';
+    }
+
+    // 2. Fall back to Redis cache
+    if (feeBps == null) {
+      const cached = await cache.get(CACHE_KEY);
+      if (cached != null) {
+        feeBps = parseInt(cached, 10);
+        feeRateSource = 'cached';
+      }
+    }
+
+    // 3. Fall back to env var
+    if (feeBps == null) {
+      feeBps = FALLBACK_PLATFORM_FEE_BPS;
+      feeRateSource = 'config_fallback';
+      logger.warn('Fee rate falling back to PLATFORM_FEE_BPS env var', { feeBps });
+    }
+
     let stellarFeeStroops = null;
     try { stellarFeeStroops = await fetchFee(); } catch (_) { /* non-fatal */ }
     const breakdown = await buildFeeBreakdown(amount, asset, stellarFeeStroops);
-    res.json({ fee_breakdown: breakdown });
+    // Override fee_bps with the on-chain/cached value
+    breakdown.platform_fee_bps = feeBps;
+    breakdown.platform_fee_usdc = parseFloat((parseFloat(amount) * feeBps / 10000).toFixed(7));
+    breakdown.net_amount_usdc = parseFloat((parseFloat(amount) - breakdown.platform_fee_usdc).toFixed(7));
+
+    res.json({
+      fee_breakdown: breakdown,
+      fee_rate_bps: feeBps,
+      fee_rate_source: feeRateSource,
+      last_fetched_at: lastFetchedAt,
+    });
   } catch (err) {
     next(err);
   }
@@ -340,76 +393,87 @@ async function send(req, res, next) {
       return res.status(400).json({ error: "Cannot send payment to your own wallet" });
     }
 
-    const overLimit = await dailyLimitExceeded(public_key, amount);
-    if (overLimit) {
-      webhook.deliver("payment.failed", { code: "DAILY_LIMIT_EXCEEDED", error: `Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.` }).catch(() => {});
-      return res.status(400).json({
-        error: `Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`,
-        code: "DAILY_LIMIT_EXCEEDED",
+    // AML re-screen for high-value payments — fail closed when screening is unavailable
+    await amlRescreenForPayment(req.user.userId, public_key, estimatedUSD);
+
+    // Use a per-wallet distributed lock to prevent concurrent sends from
+    // racing past the daily-limit check (issue #888).
+    const lockKey = `daily_limit:${public_key}`;
+    let txResult;
+    const lockAcquired = await withLock(lockKey, 10, async () => {
+      const overLimit = await dailyLimitExceeded(public_key, amount);
+      if (overLimit) {
+        throw Object.assign(new Error(`Daily send limit of ${DAILY_SEND_LIMIT} reached. Try again tomorrow.`), {
+          status: 400, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+        });
+      }
+
+      // Fraud protection — velocity and daily limit (single authoritative check)
+      const [isSuspicious, limitExceeded] = await Promise.all([
+        checkVelocity(public_key),
+        checkDailyLimit(public_key, amount, asset),
+      ]);
+      if (isSuspicious) {
+        throw Object.assign(new Error("Transaction limit reached. Please wait before sending again."), { status: 429 });
+      }
+      const fraudCheck = await checkFraud(public_key, amount, asset);
+      if (fraudCheck.blocked) {
+        await logFraudBlock(public_key, fraudCheck.reason, amount, asset);
+        throw Object.assign(new Error(fraudCheck.reason), { status: 429 });
+      }
+
+      if (await isMemoRequired(recipient_address) && !memo) {
+        throw Object.assign(new Error("This address requires a memo to route your payment correctly. Please include a memo."), {
+          status: 422, payload: { code: "MEMO_REQUIRED" },
+        });
+      }
+      if (limitExceeded) {
+        throw Object.assign(new Error("Daily send limit reached. Try again later."), {
+          status: 429, payload: { code: "DAILY_LIMIT_EXCEEDED" },
+        });
+      }
+
+      // Balance check — fail fast with a clear message before hitting Stellar
+      await checkSufficientBalance(public_key, amount, asset);
+
+      // Broadcast to Stellar
+      const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
+        senderPublicKey: public_key,
+        encryptedSecretKey: encrypted_secret_key,
+        recipientPublicKey: recipient_address,
+        amount,
+        asset,
+        memo: memo || undefined,
+        memoType: memo ? memo_type : undefined,
+        feePriority: fee_priority,
+      }, req.logger);
+
+      const ledger_close_time = await fetchLedgerCloseTime(ledger);
+
+      // Build fee breakdown
+      const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
+
+      // Save to DB
+      const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
+      await db.query(
+        `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+        [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
+      );
+
+      txResult = { transactionHash, ledger, type, claimableBalanceId, fee_breakdown, txStatus };
+    });
+
+    if (!lockAcquired) {
+      // Lock was held by another request — treat as rate-limited
+      return res.status(429).json({
+        error: "Too many concurrent payment requests. Please try again.",
+        code: "CONCURRENCY_LIMIT",
       });
     }
 
-    // Fraud protection — velocity and daily limit (single authoritative check)
-    const [isSuspicious, limitExceeded] = await Promise.all([
-      checkVelocity(public_key),
-      checkDailyLimit(public_key, amount, asset),
-    ]);
-    if (isSuspicious) {
-      webhook.deliver("payment.failed", { code: "FRAUD_BLOCKED", error: "Transaction limit reached. Please wait before sending again." }).catch(() => {});
-      return res
-        .status(429)
-        .json({ error: "Transaction limit reached. Please wait before sending again." });
-    }
-    const fraudCheck = await checkFraud(public_key, amount, asset);
-    if (fraudCheck.blocked) {
-      await logFraudBlock(public_key, fraudCheck.reason, amount, asset);
-      webhook.deliver("payment.failed", { code: "FRAUD_BLOCKED", error: fraudCheck.reason }).catch(() => {});
-      return res.status(429).json({ error: fraudCheck.reason });
-    }
-
-    if (await isMemoRequired(recipient_address) && !memo) {
-      return res.status(422).json({
-        error: "This address requires a memo to route your payment correctly. Please include a memo.",
-        code: "MEMO_REQUIRED",
-      });
-    }
-    if (limitExceeded) {
-      webhook.deliver("payment.failed", { code: "DAILY_LIMIT_EXCEEDED", error: "Daily send limit reached. Try again later." }).catch(() => {});
-      return res
-        .status(429)
-        .json({ error: "Daily send limit reached. Try again later.", code: "DAILY_LIMIT_EXCEEDED" });
-    }
-
-    // Balance check — fail fast with a clear message before hitting Stellar
-    await checkSufficientBalance(public_key, amount, asset);
-
-    // Broadcast to Stellar
-    const { transactionHash, ledger, type, claimableBalanceId, feeCharged } = await sendPayment({
-      senderPublicKey: public_key,
-      encryptedSecretKey: encrypted_secret_key,
-      recipientPublicKey: recipient_address,
-      amount,
-      asset,
-      memo: memo || undefined,
-      memoType: memo ? memo_type : undefined,
-      feePriority: fee_priority,
-    }, req.logger);
-
-    const ledger_close_time = await fetchLedgerCloseTime(ledger);
-
-    // Build fee breakdown
-    const fee_breakdown = await buildFeeBreakdown(amount, asset, feeCharged ?? null);
-
-    // Save to DB
-    const txStatus = type === "claimable_balance" ? "pending_claim" : "confirming";
-    await db.query(
-      `INSERT INTO transactions (id, sender_wallet, recipient_wallet, amount, asset, memo, memo_type, tx_hash, status, claimable_balance_id, request_id, is_encrypted, encrypted_memo, ledger_close_time, fee_breakdown)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
-      [txId, public_key, recipient_address, amount, asset, memo || null, memo_type, transactionHash, txStatus, claimableBalanceId || null, req.requestId, is_encrypted, encrypted_memo, ledger_close_time, JSON.stringify(fee_breakdown)],
-    );
-
-    if (type !== "claimable_balance") {
-      pollTransactionConfirmation(txId, transactionHash).catch(() => {});
+    if (txResult.type !== "claimable_balance") {
+      pollTransactionConfirmation(txId, txResult.transactionHash).catch(() => {});
     }
 
     await cache.del(`balance:${public_key}`);
@@ -422,11 +486,15 @@ async function send(req, res, next) {
       creditReferralReward(req.user.userId, txId).catch(() => {});
     }
 
+    const loyaltyPoints = Math.max(1, Math.floor(parseFloat(amount)));
+    enqueueMint({ userId: req.user.userId, walletAddress: public_key, points: loyaltyPoints }).catch((err) => {
+      logger.error('Failed to enqueue loyalty mint', { userId: req.user.userId, error: err.message });
+    });
     // Queue loyalty mint for background processing after confirmation
     enqueueLoyaltyMint(txId, req.user.userId, public_key, amount, asset).catch(() => {});
 
-    if (asset === "USDC" && fee_breakdown.platform_fee_bps > 0) {
-      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * fee_breakdown.platform_fee_bps / 10000);
+    if (asset === "USDC" && txResult.fee_breakdown.platform_fee_bps > 0) {
+      const feeStroops = Math.floor(parseFloat(amount) * 1e7 * txResult.fee_breakdown.platform_fee_bps / 10000);
       if (feeStroops > 0) {
         depositFee(feeStroops).catch((err) =>
           logger.warn("Fee deposit failed (non-critical):", { error: err.message }),
@@ -434,14 +502,14 @@ async function send(req, res, next) {
       }
     }
 
-    const txData = { id: txId, tx_hash: transactionHash, ledger, amount, asset, sender: public_key, recipient: recipient_address, type };
+    const txData = { id: txId, tx_hash: txResult.transactionHash, ledger: txResult.ledger, amount, asset, sender: public_key, recipient: recipient_address, type: txResult.type };
     webhook.deliver("payment.sent", txData).catch(() => {});
-    if (type !== "claimable_balance") {
+    if (txResult.type !== "claimable_balance") {
       webhook.deliver("payment.received", txData).catch(() => {});
     }
 
     // Fire-and-forget email notifications
-    const emailTxData = { amount, asset, senderAddress: public_key, recipientAddress: recipient_address, memo: memo || null, txHash: transactionHash };
+    const emailTxData = { amount, asset, senderAddress: public_key, recipientAddress: recipient_address, memo: memo || null, txHash: txResult.transactionHash };
     db.query("SELECT email FROM users WHERE id = $1", [req.user.userId])
       .then(({ rows }) => rows[0] && sendTransactionEmail(rows[0].email, "sent", emailTxData))
       .catch(() => {});
@@ -471,17 +539,17 @@ async function send(req, res, next) {
     }).catch(() => {});
 
     res.json({
-      message: type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",
+      message: txResult.type === "claimable_balance" ? "Claimable balance created" : "Payment sent successfully",
       transaction: {
         id: txId,
-        tx_hash: transactionHash,
-        ledger,
+        tx_hash: txResult.transactionHash,
+        ledger: txResult.ledger,
         amount,
         asset,
         recipient: recipient_address,
-        type,
-        claimableBalanceId,
-        fee_breakdown,
+        type: txResult.type,
+        claimableBalanceId: txResult.claimableBalanceId,
+        fee_breakdown: txResult.fee_breakdown,
       },
     });
   } catch (err) {
@@ -537,6 +605,9 @@ async function sendBatch(req, res, next) {
 
     ({ public_key } = wallet);
     const { encrypted_secret_key } = wallet;
+
+    // AML re-screen for high-value batches — fail closed when screening is unavailable
+    await amlRescreenForPayment(req.user.userId, public_key, estimateUSDValue(totalAmount, asset));
 
     const overLimit = await dailyLimitExceeded(public_key, totalAmount);
     if (overLimit) {
@@ -804,6 +875,9 @@ async function sendPath(req, res, next) {
 
     if (recipient_address === public_key) return res.status(400).json({ error: "Cannot send payment to your own wallet" });
 
+    // AML re-screen for high-value payments — fail closed when screening is unavailable
+    await amlRescreenForPayment(req.user.userId, public_key, estimatedUSD);
+
     const fraudCheck = await checkFraud(public_key, source_amount, source_asset);
     if (fraudCheck.blocked) {
       await logFraudBlock(public_key, fraudCheck.reason, source_amount, source_asset);
@@ -912,6 +986,9 @@ async function sendStrictReceivePath(req, res, next) {
 
     if (recipient_address === public_key) return res.status(400).json({ error: "Cannot send payment to your own wallet" });
 
+    // AML re-screen for high-value payments — fail closed when screening is unavailable
+    await amlRescreenForPayment(req.user.userId, public_key, estimatedUSD);
+
     const fraudCheck = await checkFraud(public_key, source_max_amount, source_asset);
     if (fraudCheck.blocked) {
       await logFraudBlock(public_key, fraudCheck.reason, source_max_amount, source_asset);
@@ -986,10 +1063,6 @@ const EXPORT_ROW_LIMIT = parseInt(process.env.EXPORT_ROW_LIMIT || "1000000", 10)
 const EXPORT_BATCH_SIZE = 500;
 
 async function exportCSV(req, res, next) {
-  const walletResult = await db.query(
-    "SELECT public_key FROM wallets WHERE user_id = $1 ORDER BY is_default DESC, created_at ASC LIMIT 1",
-    [req.user.userId],
-  ).catch(() => null);
   let client;
   try {
     const walletResult = await db.query(
@@ -998,100 +1071,13 @@ async function exportCSV(req, res, next) {
     );
     if (!walletResult.rows[0]) return res.status(404).json({ error: "Wallet not found" });
 
-  if (!walletResult?.rows[0]) return res.status(404).json({ error: "Wallet not found" });
-  const { public_key } = walletResult.rows[0];
+    const { public_key } = walletResult.rows[0];
 
-  const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
-  if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
-    return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
-  }
-
-  const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
-  let filename;
-  if (req.query.from || req.query.to) {
-    const from = sanitize((req.query.from || "").slice(0, 10));
-    const to = sanitize((req.query.to || "").slice(0, 10));
-    filename = `transactions_${from}_to_${to}.csv`;
-  } else {
-    const today = new Date().toISOString().slice(0, 10);
-    filename = `transactions_exported_${today}.csv`;
-  }
-
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
-  const stringifier = csvStream({
-    header: true,
-    columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
-  });
-  stringifier.pipe(res);
-
-  const client = await db.pool.connect();
-  let rowCount = 0;
-  let streamErrored = false;
-
-  try {
-    const params = [public_key];
-    let filters = "";
-    if (req.query.from) { params.push(req.query.from); filters += ` AND created_at >= $${params.length}`; }
-    if (req.query.to) { params.push(req.query.to); filters += ` AND created_at <= $${params.length}`; }
-    if (req.query.status) { params.push(req.query.status); filters += ` AND status = $${params.length}`; }
-    if (req.query.direction === "sent") filters += " AND sender_wallet = $1";
-    else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
-
-    await client.query("BEGIN");
-    await client.query(
-      `DECLARE txexport CURSOR FOR
-       SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
-       FROM transactions
-       WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
-       ORDER BY created_at DESC
-       LIMIT ${EXPORT_ROW_LIMIT}`,
-      params,
-    );
-
-    while (true) {
-      const batch = await client.query(`FETCH ${EXPORT_BATCH_SIZE} FROM txexport`);
-      if (batch.rows.length === 0) break;
-
-      for (const tx of batch.rows) {
-        stringifier.write({
-          date: new Date(tx.created_at).toISOString(),
-          direction: tx.sender_wallet === public_key ? "sent" : "received",
-          amount: tx.amount,
-          asset: tx.asset,
-          recipient_or_sender: tx.sender_wallet === public_key ? tx.recipient_wallet : tx.sender_wallet,
-          memo: tx.memo || "",
-          tx_hash: tx.tx_hash || "",
-          status: tx.status,
-        });
-      }
-
-      rowCount += batch.rows.length;
-      if (rowCount >= EXPORT_ROW_LIMIT) break;
+    const ALLOWED_STATUSES = ["pending", "completed", "cancelled", "failed"];
+    if (req.query.status && !ALLOWED_STATUSES.includes(req.query.status)) {
+      return res.status(400).json({ error: `Invalid status value. Must be one of: ${ALLOWED_STATUSES.join(", ")}` });
     }
 
-    await client.query("CLOSE txexport");
-    await client.query("COMMIT");
-  } catch (err) {
-    streamErrored = true;
-    logger.error("CSV export cursor error", { error: err.message });
-    try { await client.query("ROLLBACK"); } catch (_) {}
-    // Append an error sentinel row so the client knows the export was interrupted
-    stringifier.write({
-      date: new Date().toISOString(),
-      direction: "ERROR",
-      amount: "",
-      asset: "",
-      recipient_or_sender: "",
-      memo: "ERROR: Export interrupted. Please retry.",
-      tx_hash: "",
-      status: "error",
-    });
-  } finally {
-    client.release();
-    stringifier.end();
-    // Build filename before streaming starts
     const sanitize = (s) => s.replace(/[^0-9a-zA-Z_\-]/g, "");
     let filename;
     if (req.query.from || req.query.to) {
@@ -1106,33 +1092,39 @@ async function exportCSV(req, res, next) {
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
-    // Use a dedicated client for the cursor so we can keep it open across fetches
+    const stringifier = stringifyStream({
+      header: true,
+      columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
+    });
+    stringifier.pipe(res);
+
     client = await db.pool.connect();
     const cursorName = `export_cursor_${Date.now()}`;
+
+    const params = [public_key];
+    let filters = "";
+    if (req.query.from)      { params.push(req.query.from);   filters += ` AND created_at >= $${params.length}`; }
+    if (req.query.to)        { params.push(req.query.to);     filters += ` AND created_at <= $${params.length}`; }
+    if (req.query.status)    { params.push(req.query.status); filters += ` AND status = $${params.length}`; }
+    if (req.query.direction === "sent")     filters += " AND sender_wallet = $1";
+    else if (req.query.direction === "received") filters += " AND recipient_wallet = $1";
+
     await client.query("BEGIN");
     await client.query(
       `DECLARE ${cursorName} CURSOR FOR
        SELECT created_at, sender_wallet, recipient_wallet, amount, asset, memo, tx_hash, status
        FROM transactions
        WHERE (sender_wallet = $1 OR recipient_wallet = $1)${filters}
-       ORDER BY created_at DESC`,
+       ORDER BY created_at DESC
+       LIMIT ${EXPORT_ROW_LIMIT}`,
       params,
     );
 
-    const csvStream = stringifyStream({
-      header: true,
-      columns: ["date", "direction", "amount", "asset", "recipient_or_sender", "memo", "tx_hash", "status"],
-    });
-
-    csvStream.pipe(res);
-
-    const BATCH = 500;
-    // eslint-disable-next-line no-constant-condition
     while (true) {
-      const { rows } = await client.query(`FETCH ${BATCH} FROM ${cursorName}`);
-      if (rows.length === 0) break;
-      for (const tx of rows) {
-        const ok = csvStream.write({
+      const batch = await client.query(`FETCH ${EXPORT_BATCH_SIZE} FROM ${cursorName}`);
+      if (batch.rows.length === 0) break;
+      for (const tx of batch.rows) {
+        const ok = stringifier.write({
           date: new Date(tx.created_at).toISOString(),
           direction: tx.sender_wallet === public_key ? "sent" : "received",
           amount: tx.amount,
@@ -1142,23 +1134,27 @@ async function exportCSV(req, res, next) {
           tx_hash: tx.tx_hash || "",
           status: tx.status,
         });
-        // Respect backpressure
-        if (!ok) await new Promise((resolve) => csvStream.once("drain", resolve));
+        if (!ok) await new Promise((resolve) => stringifier.once("drain", resolve));
       }
     }
 
-    csvStream.end();
-    await client.query("CLOSE " + cursorName);
+    await client.query(`CLOSE ${cursorName}`);
     await client.query("COMMIT");
-    client.release();
-    client = null;
   } catch (err) {
-    if (client) {
-      try { await client.query("ROLLBACK"); } catch (_) {}
-      client.release();
+    logger.error("CSV export cursor error", { error: err.message });
+    try { if (client) await client.query("ROLLBACK"); } catch (_) {}
+    // Append error sentinel row if headers already sent, otherwise pass to next()
+    if (res.headersSent) {
+      try {
+        // stringifier may already be ended; ignore errors
+        res.write('\n"' + new Date().toISOString() + '","ERROR","","","","ERROR: Export interrupted. Please retry.","","error"\n');
+        res.end();
+      } catch (_) {}
+    } else {
+      next(err);
     }
-    // Headers may already be sent if streaming started; just destroy the connection
-    if (res.headersSent) { res.destroy(); } else { next(err); }
+  } finally {
+    if (client) { client.release(); }
   }
 }
 

@@ -1,16 +1,29 @@
-const crypto = require('crypto');
+'use strict';
+
 const https = require('https');
 const db = require('../db');
-const logger = require('../utils/logger');
-const { isPrivateIp } = require('../utils/ssrfValidator');
+const { sign } = require('../utils/webhookSignature');
 const { validateOutboundUrl } = require('../utils/ssrf');
 const { decryptSecret } = require('../utils/symmetricEncryption');
+const { sign, buildSignatureHeader } = require('../utils/webhookSignature');
+const logger = require('../utils/logger');
+const { validatePublicUrl: isPublicHttpsUrl } = require('../utils/ssrf');
 
 const MAX_ATTEMPTS = 3;
 
+function sign(secret, payload) {
+  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+}
+
+function httpsPost(url, body, signature) {
 /**
- * Check if a URL is a valid public HTTPS endpoint
- * Re-validates before each delivery to catch DNS rebinding attacks
+ * Perform a single HTTPS POST with the AfriPay webhook signature header.
+ *
+ * @param {string} url       - Fully-qualified HTTPS URL
+ * @param {string} body      - JSON-serialised payload string
+ * @param {string} signature - Hex HMAC-SHA256 digest of body
+ * @param {import('https').Agent|undefined} agent - DNS-pinned agent (SSRF protection)
+ * @returns {Promise<number>} Resolves with the HTTP status code on 2xx
  */
 async function isPublicHttpsUrl(url) {
   let parsed;
@@ -44,11 +57,8 @@ async function isPublicHttpsUrl(url) {
   return true;
 }
 
-function sign(secret, payload) {
-  return crypto.createHmac('sha256', secret).update(payload).digest('hex');
-}
-
 function httpsPost(url, body, signature) {
+function httpsPost(url, body, signature, agent) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const options = {
@@ -61,14 +71,20 @@ function httpsPost(url, body, signature) {
         'Content-Length': Buffer.byteLength(body),
         'X-AfriPay-Signature-256': `sha256=${signature}`,
       },
+      // Use the DNS-pinned agent from SSRF validation to prevent DNS rebinding
+      ...(agent && { agent }),
     };
     const req = https.request(options, (res) => {
       res.resume();
       // Block redirects to prevent DNS rebinding via 3xx responses
       if (res.statusCode >= 300 && res.statusCode < 400) {
-        return reject(new Error(`Redirect blocked (HTTP ${res.statusCode}) — follow redirects is disabled for security`));
+        return reject(
+          new Error(`Redirect blocked (HTTP ${res.statusCode}) — follow redirects is disabled for security`)
+        );
       }
-      res.statusCode >= 200 && res.statusCode < 300 ? resolve(res.statusCode) : reject(new Error(`HTTP ${res.statusCode}`));
+      res.statusCode >= 200 && res.statusCode < 300
+        ? resolve(res.statusCode)
+        : reject(new Error(`HTTP ${res.statusCode}`));
     });
     req.on('error', reject);
     req.write(body);
@@ -95,75 +111,133 @@ async function updateDeliveryLog(deliveryId, status, statusCode, responseTimeMs,
   );
 }
 
-async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
+// Build the list of plaintext secrets a delivery should be signed with: the
+// current secret, plus the previous one if it's still inside its rotation
+// overlap window — lets a merchant who hasn't rolled their verification key
+// yet keep validating deliveries sent right after a rotation.
+function activeSecrets(row) {
+  const secrets = [decryptSecret(row.secret)];
+  if (row.previous_secret && row.previous_secret_expires_at && new Date(row.previous_secret_expires_at) > new Date()) {
+    secrets.push(decryptSecret(row.previous_secret));
+  }
+  return secrets;
+}
+
+async function deliverWithRetry(webhookId, url, secrets, payload, attempt = 0) {
   // Re-validate URL before each delivery to catch DNS rebinding / stale records
-  const ssrfCheck = await validateOutboundUrl(url);
-  if (!ssrfCheck.valid) {
-    logger.error('Webhook delivery blocked: URL failed SSRF validation', { url, reason: ssrfCheck.error });
+  if (!await isPublicHttpsUrl(url)) {
+    logger.error('Webhook delivery blocked: URL failed SSRF validation', { url });
     await createDeliveryLog(webhookId, payload.event, url, attempt + 1, MAX_ATTEMPTS, payload)
       .then((id) => updateDeliveryLog(id, 'failed', null, null, 'SSRF validation failed'));
+/**
+ * Deliver a webhook payload to a single subscriber URL with exponential-backoff retry.
+ *
+ * On each failed attempt before the last one, logs a warning with metadata so
+ * operators can track transient delivery failures.  After exhausting all attempts,
+ * logs a single error.
+ *
+ * @param {string|null} webhookId - Subscriber row ID (for logging; may be null)
+ * @param {string}      url       - Target HTTPS endpoint
+ * @param {string}      secret    - Plain-text HMAC secret (already decrypted by caller)
+ * @param {object}      payload   - Object with at minimum { event: string }
+ * @param {number}      [attempt=0] - Zero-based attempt counter (used internally for retries)
+ */
+async function deliverWithRetry(webhookId, url, secret, payload, attempt = 0) {
+  const ssrfCheck = await validateOutboundUrl(url);
+  if (!ssrfCheck.valid) {
+    logger.error('Webhook delivery blocked: URL failed SSRF validation', {
+      url,
+      reason: ssrfCheck.error,
+    });
     return;
   }
+
   const body = JSON.stringify(payload);
-  const signature = sign(secret, body);
+  const signature = buildSignatureHeader(secrets, body);
   const deliveryId = await createDeliveryLog(webhookId, payload.event, url, attempt + 1, MAX_ATTEMPTS, payload);
   const start = Date.now();
+  const signature = sign(secret, body);
+
   try {
-    const statusCode = await httpsPost(url, body, signature);
-    const responseTime = Date.now() - start;
-    await updateDeliveryLog(deliveryId, 'delivered', statusCode, responseTime, null);
+    await httpsPost(url, body, signature, ssrfCheck.agent);
   } catch (err) {
-    const responseTime = Date.now() - start;
-    const statusCodeMatch = err.message.match(/HTTP (\d+)/);
-    const statusCode = statusCodeMatch ? parseInt(statusCodeMatch[1]) : null;
+    const errMessage = err.message.includes('Error:')
+      ? err.message.replace(/^Error:\s*/, '')
+      : err.message;
+
     if (attempt < MAX_ATTEMPTS - 1) {
-      const delay = Math.pow(2, attempt) * 1000;
+      // Transient failure — log a warning and schedule a retry
       logger.warn('Webhook delivery failed, retrying', {
         url,
         attempt: attempt + 1,
         maxAttempts: MAX_ATTEMPTS,
-        delay,
-        error: err.message,
+        error: errMessage,
+      });
+      const delay = Math.pow(2, attempt) * 1000;
+      setTimeout(() => deliverWithRetry(webhookId, url, secret, payload, attempt + 1), delay);
+    } else {
+      // Final attempt failed — log an error and give up
+      logger.error('Webhook delivery permanently failed', {
+        url,
+        event: payload.event,
+        attempts: MAX_ATTEMPTS,
+        error: errMessage,
       });
       await new Promise((r) => setTimeout(r, delay));
-      return deliverWithRetry(webhookId, url, secret, payload, attempt + 1);
+      return deliverWithRetry(webhookId, url, secrets, payload, attempt + 1);
     }
-    // All attempts exhausted
-    await updateDeliveryLog(deliveryId, 'failed', statusCode, responseTime, err.message);
-    logger.error('Webhook delivery permanently failed after max retries', {
-      url,
-      event: payload.event,
-      attempts: MAX_ATTEMPTS,
-      error: err.message,
-    });
   }
 }
 
 async function retryDelivery(deliveryId) {
   const { rows } = await db.query(
-    `SELECT wd.webhook_id, wd.target_url, wd.payload, wd.event_type, w.url, w.secret
+    `SELECT wd.webhook_id, wd.target_url, wd.payload, wd.event_type,
+            w.url, w.secret, w.previous_secret, w.previous_secret_expires_at
      FROM webhook_deliveries wd
      JOIN webhooks w ON w.id = wd.webhook_id
      WHERE wd.id = $1 AND wd.status = 'failed'`,
     [deliveryId]
   );
   if (!rows.length) throw new Error('Delivery not found or not failed');
-  const { url, secret, payload, event_type } = rows[0];
-  const parsedPayload = typeof payload === 'string' ? JSON.parse(payload) : payload;
-  await deliverWithRetry(null, url, secret, { ...parsedPayload, event: event_type });
+  const row = rows[0];
+  const parsedPayload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
+  await deliverWithRetry(row.webhook_id, row.url, activeSecrets(row), { ...parsedPayload, event: row.event_type });
 }
 
+/**
+ * Fan-out a webhook event to every active subscriber registered for that event.
+ *
+ * Wraps each delivery in a fire-and-forget pattern: errors are logged but never
+ * propagate to the caller so a bad subscriber never disrupts the payment flow.
+ *
+ * @param {string} event - Event name, e.g. "payment.sent"
+ * @param {object} data  - Arbitrary event-specific payload data
+ * @returns {Promise<void>}
+ */
 async function deliver(event, data) {
   const { rows } = await db.query(
-    `SELECT id, url, secret FROM webhooks WHERE active = true AND $1 = ANY(events)`,
+    `SELECT id, url, secret, previous_secret, previous_secret_expires_at
+     FROM webhooks WHERE active = true AND $1 = ANY(events)`,
     [event]
   );
   const timestamp = Math.floor(Date.now() / 1000);
   const payload = { timestamp, event, data };
-  await Promise.all(rows.map((wh) => {
-    const plainSecret = decryptSecret(wh.secret);
-    return deliverWithRetry(wh.url, plainSecret, payload);
-  }));
+  await Promise.all(rows.map((wh) => deliverWithRetry(wh.id, wh.url, activeSecrets(wh), payload)));
+
+  if (!rows.length) return;
+
+  const payload = {
+    event,
+    data,
+    timestamp: Date.now(),
+  };
+
+  await Promise.all(
+    rows.map((wh) => {
+      const plainSecret = decryptSecret(wh.secret);
+      return deliverWithRetry(wh.id || null, wh.url, plainSecret, payload);
+    })
+  );
 }
 
-module.exports = { deliver, sign, retryDelivery, MAX_ATTEMPTS };
+module.exports = { deliver, deliverWithRetry, sign, MAX_ATTEMPTS };

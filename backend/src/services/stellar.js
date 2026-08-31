@@ -9,10 +9,17 @@ const {
   AccountResponseSchema,
   TransactionSubmitResponseSchema,
   TransactionPageSchema,
+  TransactionRecordSchema,
+  OperationPageSchema,
   PathPageSchema,
   validateHorizonResponse,
 } = require('../utils/horizonSchemas');
-const { horizonRequestDuration } = require('../utils/metrics');
+const {
+  horizonRequestDuration,
+  horizonFallbackActive,
+  horizonFallbackDurationSeconds,
+  horizonFallbackAlertsTotal,
+} = require('../utils/metrics');
 
 const isTestnet = process.env.STELLAR_NETWORK !== 'mainnet';
 const networkPassphrase = isTestnet
@@ -64,17 +71,119 @@ function isNetworkError(err) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// BE-036: Alert when Horizon fallback has been active for longer than expected.
+//
+// `fallbackActivatedAt` tracks when we most recently *started* a continuous
+// run of successful fallback-node usage. It is cleared as soon as a request
+// succeeds on the primary again, so "duration on fallback" reflects the
+// current continuous activation, not lifetime fallback usage. A periodic
+// checker compares that duration against a configurable threshold and logs
+// an alert (rate-limited) when it's exceeded — this is what lets operators
+// notice "we've been degraded for 20 minutes" rather than discovering it via
+// a harder-to-diagnose downstream incident.
+// ---------------------------------------------------------------------------
+let fallbackActivatedAt = null;
+let lastFallbackAlertAt = null;
+
+const FALLBACK_ALERT_THRESHOLD_MS =
+  parseInt(process.env.HORIZON_FALLBACK_ALERT_THRESHOLD_MS || '', 10) || 15 * 60 * 1000; // 15 min default
+const FALLBACK_ALERT_REPEAT_MS =
+  parseInt(process.env.HORIZON_FALLBACK_ALERT_REPEAT_MS || '', 10) || 15 * 60 * 1000; // don't spam more than every 15 min
+
+function markFallbackActive() {
+  if (!fallbackActivatedAt) fallbackActivatedAt = Date.now();
+  horizonFallbackActive.set(1);
+}
+
+function markPrimaryHealthy() {
+  fallbackActivatedAt = null;
+  lastFallbackAlertAt = null;
+  horizonFallbackActive.set(0);
+  horizonFallbackDurationSeconds.set(0);
+}
+
+/**
+ * Current continuous fallback-activation duration in ms, or 0 if on primary.
+ */
+function getFallbackDurationMs() {
+  return fallbackActivatedAt ? Date.now() - fallbackActivatedAt : 0;
+}
+
+/**
+ * Returns the current Horizon endpoint status for health checks / dashboards.
+ */
+function getHorizonEndpointStatus() {
+  const durationMs = getFallbackDurationMs();
+  return {
+    node: fallbackActivatedAt ? 'fallback' : 'primary',
+    fallbackConfigured: Boolean(fallbackServer),
+    fallbackActiveDurationMs: durationMs,
+    fallbackActivatedAt: fallbackActivatedAt ? new Date(fallbackActivatedAt).toISOString() : null,
+    alertThresholdMs: FALLBACK_ALERT_THRESHOLD_MS,
+    alertExceeded: durationMs > FALLBACK_ALERT_THRESHOLD_MS,
+  };
+}
+
+/**
+ * Periodic check (intended to be called on an interval, e.g. every minute)
+ * that alerts when fallback has been continuously active longer than the
+ * configured threshold. Re-alerts at most once per FALLBACK_ALERT_REPEAT_MS
+ * to avoid log/alert spam while the condition persists.
+ */
+function checkFallbackDuration() {
+  horizonFallbackDurationSeconds.set(getFallbackDurationMs() / 1000);
+
+  if (!fallbackActivatedAt) return false;
+
+  const durationMs = getFallbackDurationMs();
+  if (durationMs <= FALLBACK_ALERT_THRESHOLD_MS) return false;
+
+  const now = Date.now();
+  if (lastFallbackAlertAt && now - lastFallbackAlertAt < FALLBACK_ALERT_REPEAT_MS) return false;
+
+  lastFallbackAlertAt = now;
+  horizonFallbackAlertsTotal.inc();
+  logger.error('ALERT: Horizon fallback node has been active longer than expected', {
+    fallbackUrl,
+    activeDurationMs: durationMs,
+    thresholdMs: FALLBACK_ALERT_THRESHOLD_MS,
+  });
+  return true;
+}
+
+let fallbackDurationCheckTimer = null;
+
+/**
+ * Start the periodic fallback-duration checker. Safe to call multiple times
+ * (no-op if already started). Exported so app startup can wire it in.
+ */
+function startFallbackDurationMonitor(intervalMs = 60 * 1000) {
+  if (fallbackDurationCheckTimer) return fallbackDurationCheckTimer;
+  fallbackDurationCheckTimer = setInterval(checkFallbackDuration, intervalMs);
+  if (typeof fallbackDurationCheckTimer.unref === 'function') fallbackDurationCheckTimer.unref();
+  return fallbackDurationCheckTimer;
+}
+
+function stopFallbackDurationMonitor() {
+  if (fallbackDurationCheckTimer) {
+    clearInterval(fallbackDurationCheckTimer);
+    fallbackDurationCheckTimer = null;
+  }
+}
+
 /**
  * Execute fn(server) with automatic failover to the fallback node on network errors only.
- * Records Horizon call duration via Prometheus.
+ * Records Horizon call duration via Prometheus, and tracks fallback activation
+ * duration for BE-036 alerting.
  */
-async function withFallback(fn, logger = require('../utils/logger')) {
 async function withFallback(fn, operation = 'unknown') {
   const end = horizonRequestDuration.startTimer({ operation });
   try {
     const result = await fn(server);
     end({ success: 'true' });
     logger.debug('Horizon request succeeded', { node: 'primary', url: primaryUrl });
+    markPrimaryHealthy();
     return result;
   } catch (primaryErr) {
     if (!isNetworkError(primaryErr) || !fallbackServer) {
@@ -90,6 +199,8 @@ async function withFallback(fn, operation = 'unknown') {
       const result = await fn(fallbackServer);
       end({ success: 'true' });
       logger.info('Horizon request succeeded on fallback node', { url: fallbackUrl });
+      markFallbackActive();
+      checkFallbackDuration();
       return result;
     } catch (fallbackErr) {
       end({ success: 'false' });
@@ -694,6 +805,62 @@ async function getTransactions(publicKey, limit = 20) {
   }
 }
 
+/**
+ * Verify that a given transaction hash corresponds to a successful Stellar
+ * transaction that pays at least `minAmount` of `asset` to `destination`.
+ * Used to confirm claimed payment requests before trusting a caller-supplied
+ * txHash (issue #878).
+ *
+ * @returns {Promise<{verified: boolean, reason?: string}>}
+ */
+async function verifyIncomingPayment({ txHash, destination, asset, minAmount }) {
+  if (typeof txHash !== 'string' || !/^[0-9a-f]{64}$/i.test(txHash)) {
+    return { verified: false, reason: 'txHash must be a 64-character hex transaction hash' };
+  }
+  const normalizedHash = txHash.toLowerCase();
+
+  let txRecord;
+  try {
+    const raw = await withFallback(s => s.transactions().transaction(normalizedHash).call());
+    txRecord = validateHorizonResponse(TransactionRecordSchema, raw, 'transactions.transaction');
+  } catch (e) {
+    if (e.response?.status === 404) {
+      return { verified: false, reason: 'Transaction not found' };
+    }
+    throw e;
+  }
+
+  if (!txRecord.successful) {
+    return { verified: false, reason: 'Transaction was not successful' };
+  }
+
+  const raw = await withFallback(s => s.operations().forTransaction(normalizedHash).call());
+  const opsPage = validateHorizonResponse(OperationPageSchema, raw, 'operations.forTransaction');
+
+  const assetObj = resolveAsset(asset);
+  const minAmountNum = parseFloat(minAmount);
+
+  const matched = opsPage.records.some(op => {
+    if (!['payment', 'path_payment_strict_receive', 'path_payment_strict_send'].includes(op.type)) {
+      return false;
+    }
+    if (op.to !== destination) return false;
+
+    const assetMatches = assetObj.isNative()
+      ? op.asset_type === 'native'
+      : op.asset_code === assetObj.getCode() && op.asset_issuer === assetObj.getIssuer();
+    if (!assetMatches) return false;
+
+    return parseFloat(op.amount) >= minAmountNum;
+  });
+
+  if (!matched) {
+    return { verified: false, reason: `No payment of at least ${minAmount} ${asset} to ${destination} found on this transaction` };
+  }
+
+  return { verified: true };
+}
+
 // Issue AFRI asset to a recipient
 async function issueAsset(recipientPublicKey, amount) {
   const issuerSecret = decryptPrivateKey(process.env.AFRI_ISSUER_SECRET);
@@ -1024,13 +1191,10 @@ async function addAccountSigner({ ownerPublicKey, encryptedSecretKey, signerPubl
     .setTimeout(30)
     .build();
 
-  transaction.sign(distributionKeypair);
-
-  const result = await server.submitTransaction(transaction);
-  return {
-    transactionHash: result.hash,
-    ledger: result.ledger
-  };
+  tx.sign(ownerKeypair);
+  const rawResult = await withRetry(() => server.submitTransaction(tx), { label: 'submitTransaction(addSigner)' });
+  const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(addSigner)');
+  return { transactionHash: result.hash };
 }
 
 // Get AFRI asset information
@@ -1087,13 +1251,6 @@ async function getStellarStats() {
     logger.error('Error fetching Stellar stats', { error: err.message });
     throw err;
   }
-}
-
-
-  tx.sign(ownerKeypair);
-  const rawResult = await withRetry(() => server.submitTransaction(tx), { label: 'submitTransaction(addSigner)' });
-  const result = validateHorizonResponse(TransactionSubmitResponseSchema, rawResult, 'submitTransaction(addSigner)');
-  return { transactionHash: result.hash };
 }
 
 /**
@@ -1454,12 +1611,17 @@ module.exports = {
   sendPayment,
   sendBatchPayment,
   getTransactions,
+  verifyIncomingPayment,
   encryptPrivateKey,
   decryptPrivateKey,
   fetchFee,
   fetchFeeStats,
   feeForPriority,
   checkHorizonHealth,
+  getHorizonEndpointStatus,
+  checkFallbackDuration,
+  startFallbackDurationMonitor,
+  stopFallbackDurationMonitor,
   findPaymentPath,
   sendPathPayment,
   validateBatchRecipient,

@@ -21,17 +21,42 @@ async function addContact(req, res, next) {
   try {
     const { name, wallet_address, notes, memo_required, default_memo, tags } = req.body;
     const id = uuidv4();
+
+    // Upsert: if the same Stellar public key already exists for this user, update
+    // the label/metadata rather than creating a duplicate entry.
+    // The DB enforces uniqueness via contacts_user_wallet_unique (user_id, wallet_address).
+    // Product decision: upsert (merge) — return the updated record with 200 if it
+    // already existed, 201 if it was newly created.
     const result = await db.query(
       `INSERT INTO contacts (id, user_id, name, wallet_address, notes, memo_required, default_memo, tags)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (user_id, wallet_address) DO UPDATE
-         SET name = $3, notes = $5, memo_required = $6, default_memo = $7, tags = $8
-       RETURNING id, name, wallet_address, notes, memo_required, default_memo, tags`,
+         SET name = EXCLUDED.name,
+             notes = EXCLUDED.notes,
+             memo_required = EXCLUDED.memo_required,
+             default_memo = EXCLUDED.default_memo,
+             tags = EXCLUDED.tags
+       RETURNING id, name, wallet_address, notes, memo_required, default_memo, tags, (xmax = 0) AS inserted`,
       [id, req.user.userId, name, wallet_address,
        notes || null, memo_required || false, default_memo || null, tags || []]
     );
-    res.status(201).json({ message: 'Contact saved', contact: result.rows[0] });
-  } catch (err) { next(err); }
+
+    const contact = result.rows[0];
+    const wasInserted = contact.inserted;
+    // Remove the internal flag from the response
+    delete contact.inserted;
+
+    const statusCode = wasInserted ? 201 : 200;
+    const message = wasInserted ? 'Contact saved' : 'Contact updated';
+    res.status(statusCode).json({ message, contact });
+  } catch (err) {
+    // Safety net: map DB unique-constraint violations to a clear conflict error
+    // in case a race bypasses the ON CONFLICT clause (e.g., a different constraint).
+    if (err.code === '23505') {
+      return res.status(409).json({ error: 'A contact with this Stellar address already exists.' });
+    }
+    next(err);
+  }
 }
 
 async function deleteContact(req, res, next) {
@@ -90,8 +115,39 @@ async function importContacts(req, res, next) {
 
     // Parse CSV from buffer — we avoid external deps and use a hand-rolled parser
     // that handles optional quotes, trims whitespace, and skips blank lines.
+    // The parser is quote-aware from the start so that fields containing embedded
+    // newlines (RFC 4180) are handled correctly.
     const csvText = req.file.buffer.toString('utf8');
-    const lines = csvText.split(/\r?\n/);
+
+    // Quote-aware line splitter: splits on newlines that are NOT inside
+    // double-quoted fields.
+    function splitCsvLines(text) {
+      const lines = [];
+      let current = '';
+      let inQuotes = false;
+      for (let i = 0; i < text.length; i++) {
+        const ch = text[i];
+        if (ch === '"') {
+          if (inQuotes && text[i + 1] === '"') { current += '"'; i++; }
+          else { inQuotes = !inQuotes; }
+        } else if ((ch === '\n' || (ch === '\r' && text[i + 1] === '\n')) && !inQuotes) {
+          if (ch === '\r') i++; // skip \n after \r
+          lines.push(current);
+          current = '';
+        } else if (ch === '\r' && !inQuotes) {
+          lines.push(current);
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+      if (current !== '' || text.endsWith('\n')) {
+        lines.push(current);
+      }
+      return lines;
+    }
+
+    const lines = splitCsvLines(csvText);
 
     if (lines.length < 2) {
       return res.status(400).json({ error: 'CSV file must contain a header row and at least one data row.' });
@@ -99,7 +155,7 @@ async function importContacts(req, res, next) {
 
     // Parse header — normalise to lowercase, strip BOM
     const headerLine = lines[0].replace(/^\uFEFF/, '').toLowerCase();
-    const headers = headerLine.split(',').map((h) => h.trim().replace(/^"|"$/g, ''));
+    const headers = parseCsvFields(headerLine);
 
     const nameIdx    = headers.indexOf('name');
     const addressIdx = headers.indexOf('address');
@@ -124,8 +180,8 @@ async function importContacts(req, res, next) {
       });
     }
 
-    // Helper: parse one CSV line respecting double-quoted fields
-    function parseCsvLine(line) {
+    // Helper: parse one CSV line into fields respecting double-quoted fields
+    function parseCsvFields(line) {
       const fields = [];
       let current = '';
       let inQuotes = false;
@@ -151,7 +207,7 @@ async function importContacts(req, res, next) {
 
     for (let i = 0; i < dataLines.length; i++) {
       const rowNum = i + 2; // 1-based, +1 for header
-      const fields = parseCsvLine(dataLines[i]);
+      const fields = parseCsvFields(dataLines[i]);
 
       const name    = (fields[nameIdx]    || '').trim();
       const address = (fields[addressIdx] || '').trim();

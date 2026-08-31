@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -15,6 +16,7 @@ const walletRoutes = require('./routes/wallet');
 const paymentRoutes = require('./routes/payments');
 const paymentRequestRoutes = require('./routes/paymentRequests');
 const scheduledPaymentRoutes = require('./routes/scheduledPayments');
+const savingsRoutes = require('./routes/savings');
 const anchorRoutes = require('./routes/anchor');
 const kycRoutes = require('./routes/kyc');
 const adminRoutes = require('./routes/admin');
@@ -43,6 +45,7 @@ const geoRestriction = require('./middleware/geoRestriction');
 
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
+const paymentSendValidators = require('./validators/paymentSendValidators');
 
 const logger = require('./utils/logger');
 const { runHealthChecks, runDeepHealthChecks } = require('./services/health');
@@ -61,11 +64,15 @@ app.use((req, res, next) => {
 });
 app.use(metricsMiddleware);
 app.use(cookieParser());
-app.use(helmet({
+app.use((req, res, next) => {
+  res.locals.cspNonce = crypto.randomBytes(16).toString('base64');
+  next();
+});
+app.use((req, res, next) => helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'none'"],
-      scriptSrc: ["'self'"],
+      scriptSrc: ["'self'", `'nonce-${res.locals.cspNonce}'`],
       connectSrc: ["'self'", 'https://horizon.stellar.org', 'wss://horizon.stellar.org'],
       imgSrc: ["'self'", 'data:'],
       frameAncestors: ["'none'"],
@@ -84,7 +91,7 @@ app.use(helmet({
     geolocation: [],
     payment: [],
   },
-}));
+})(req, res, next));
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true, maxAge: 86400 }));
 app.use(express.json());
 
@@ -97,6 +104,7 @@ app.use((req, res, next) => {
 app.use('/api/auth/login', rateLimiters.authLimiter);
 app.use('/api/auth/register', rateLimiters.authLimiter);
 app.use('/api/payments/send', rateLimiters.paymentLimiter);
+app.use('/api/wallet/export-key', rateLimiters.exportKeyLimiter);
 app.use('/api/admin', rateLimiters.adminLimiter);
 app.use('/api', rateLimiters.readLimiter);
 
@@ -105,6 +113,7 @@ app.use('/api/wallet', walletRoutes);
 app.use('/api/payments', geoRestriction, paymentRoutes);
 app.use('/api/payment-requests', geoRestriction, paymentRequestRoutes);
 app.use('/api/scheduled-payments', geoRestriction, scheduledPaymentRoutes);
+app.use('/api/savings', geoRestriction, savingsRoutes);
 app.use('/api/anchor', anchorRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/dex', dexRoutes);
@@ -122,12 +131,19 @@ app.use('/api/ledger', ledgerRoutes);
 app.use('/api/contacts', contactsRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/tools', toolsRoutes);
-app.use('/api/dev', toolsRoutes); // legacy alias
 app.use('/api/assets', assetsRoutes);
 app.use('/api/notifications', notificationRoutes);
 app.use('/.well-known/stellar', sep10Routes);
 app.use('/api/sep10', sep10Routes);
 app.use('/api/sep31', sep31Routes);
+// BE-031: /api/dev is reserved exclusively for the env-gated developer router
+// below. A "legacy alias" that also mounted toolsRoutes at /api/dev used to
+// live here (removed) — its naming collision with this router was flagged as
+// a production-exposure risk: a future refactor reordering these two
+// app.use('/api/dev', ...) calls could accidentally make dev-only tooling
+// reachable in production. devRoutes is defense-in-depth gated twice: once
+// here (NODE_ENV !== 'production') and again inside routes/dev.js itself
+// (NODE_ENV !== 'development'), so it is a 404 in any non-development env.
 if (process.env.NODE_ENV !== 'production') {
   app.use('/api/dev', devRoutes);
 }
@@ -178,7 +194,11 @@ const swaggerOptions = {
               }
             }
           }
-        }
+        },
+        // Derived directly from the express-validator field spec in
+        // validators/paymentSendValidators.js so the docs cannot drift from
+        // what the runtime validators actually accept.
+        PaymentSendRequest: paymentSendValidators.openApiSchema
       }
     }
   },
