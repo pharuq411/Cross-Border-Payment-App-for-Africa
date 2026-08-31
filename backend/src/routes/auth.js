@@ -25,6 +25,7 @@ const {
   getBackupCodeCount,
   changePassword,
   validateResetToken,
+  completeOnboarding,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
 const geoRestriction = require('../middleware/geoRestriction');
@@ -124,6 +125,7 @@ router.post(
 );
 router.get('/verify-email-change', verifyEmailChange);
 router.get('/activity', authMiddleware, getActivity);
+router.post('/onboarding-completed', authMiddleware, completeOnboarding);
 
 router.post(
   '/set-pin',
@@ -169,7 +171,6 @@ router.post(
 
 router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
 
-const { listSessions, revokeSession, revokeAllSessions } = require('../controllers/sessionController');
 // Avatar upload — 5 MB limit, memory storage (magic bytes checked in controller)
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -190,6 +191,8 @@ router.patch(
   ],
   validate,
   changePassword
+);
+
 router.post(
   '/avatar',
   authMiddleware,
