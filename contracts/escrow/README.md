@@ -346,14 +346,14 @@ Panics / Errors:
 
 Signature:
 ```rust
-fn cleanup_escrow(env: Env, admin: Address, escrow_id: u64)
+fn cleanup_escrow(env: Env, escrow_id: u64)
 ```
 
 Description:
 - Removes a completed or cancelled escrow record from persistent storage once the configured retention period has elapsed.
+- Permissionless: like `expire_escrow`, anyone may call it (no admin auth) so old records can be swept without placing the burden on the admin.
 
 Parameters:
-- `admin` (`Address`) - must authorize the cleanup.
 - `escrow_id` (`u64`) - the escrow to archive.
 
 Returns:
@@ -567,7 +567,7 @@ struct Escrow {
 
 ### Storage TTL strategy
 
-Completed or cancelled escrows are eligible for cleanup after a configurable retention period. The admin can set the retention TTL via `set_retention_period`, and then manually archive old records with `cleanup_escrow` once the escrow's `updated_at` timestamp is older than the retention threshold.
+Completed or cancelled escrows are eligible for cleanup after a configurable retention period. The admin can set the retention TTL via `set_retention_period`. Once the escrow's `updated_at` timestamp is older than the retention threshold, anyone can reclaim its storage with the permissionless `cleanup_escrow`, obviating the need for a manual admin (or automated job under the admin's key) sweep.
 
 ### `EscrowStatus` enum
 
@@ -717,7 +717,8 @@ soroban contract deploy \
 - `release_escrow`: `agent.require_auth()` + agent address match.
 - `cancel_escrow`: `sender.require_auth()` + sender address match.
 - `withdraw_fees`: `admin.require_auth()` + stored admin match.
-- `upgrade`, `migrate`, `set_retention_period`, `cleanup_escrow`, `update_fee`, `set_kyc_contract`: admin-only.
+- `upgrade`, `migrate`, `set_retention_period`, `update_fee`, `set_kyc_contract`: admin-only.
+- `expire_escrow`, `cleanup_escrow`: permissionless (anyone may call once eligible).
 
 ### Event Emission Completeness
 - `EscrowInitialized` on `initialize`.

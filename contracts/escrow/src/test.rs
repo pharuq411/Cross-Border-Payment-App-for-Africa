@@ -519,7 +519,7 @@ fn test_cleanup_escrow_after_retention() {
         li.timestamp += 90 * 24 * 60 * 60 + 1;
     });
 
-    client.cleanup_escrow(&admin, &escrow_id);
+    client.cleanup_escrow(&escrow_id);
 
     let result = std::panic::catch_unwind(|| {
         client.get_escrow(&escrow_id);
@@ -527,6 +527,36 @@ fn test_cleanup_escrow_after_retention() {
     assert!(result.is_err());
     let err_str = format!("{:?}", result.err().unwrap());
     assert!(err_str.contains("Escrow 1 not found"));
+}
+
+#[test]
+fn test_cleanup_escrow_is_permissionless() {
+    // cleanup_escrow takes no admin address, so any caller (here: admin) can
+    // reclaim storage rent once the retention period has elapsed.
+    let (env, client, admin, usdc_id) = setup();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let someone = Address::generate(&env);
+
+    mint_usdc(&env, &usdc_id, &admin, &sender, 1_000_0000000i128);
+    let escrow_id = client.create_escrow(&sender, &recipient, &agent, &1_000_0000000i128, &250);
+    client.cancel_escrow(&sender, &escrow_id);
+
+    env.ledger().with_mut(|li| {
+        li.timestamp += 90 * 24 * 60 * 60 + 1;
+    });
+
+    // Called by an arbitrary address, not the admin.
+    client.cleanup_escrow(&escrow_id);
+
+    let result = std::panic::catch_unwind(|| {
+        client.get_escrow(&escrow_id);
+    });
+    assert!(result.is_err());
+    let err_str = format!("{:?}", result.err().unwrap());
+    assert!(err_str.contains("Escrow 1 not found"));
+    let _ = &someone;
 }
 
 #[test]
