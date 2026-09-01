@@ -1,10 +1,10 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, IntoVal, Symbol};
 
 mod test;
 
 /// Semantic version of this contract. Bumped on every upgrade.
-pub const CONTRACT_VERSION: u32 = 2;
+pub const CONTRACT_VERSION: u32 = 3;
 
 #[derive(Clone)]
 #[contracttype]
@@ -129,6 +129,15 @@ pub struct EscrowDeposited {
 
 #[derive(Clone)]
 #[contracttype]
+pub struct EscrowDisputed {
+    pub escrow_id: u64,
+    pub dispute_id: u64,
+    pub opener: Address,
+    pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct Escrow {
     pub id: u64,
     pub sender: Address,
@@ -149,6 +158,11 @@ pub enum EscrowStatus {
     Pending,
     Released,
     Cancelled,
+    /// Escrowed funds have been handed to the dispute-resolution contract and
+    /// the escrow is awaiting (or already subject to) arbitration. In this state
+    /// the escrow can no longer be released, cancelled, deposited into, or
+    /// expired — the winning party is paid directly by the dispute contract.
+    UnderDispute,
 }
 
 #[contracttype]
@@ -160,6 +174,7 @@ pub enum DataKey {
     RetentionPeriodSecs,
     Escrow(u64),
     KycContractAddress,
+    DisputeContractAddress,
     ContractVersion,
 }
 
@@ -553,6 +568,92 @@ impl EscrowContract {
                 agent,
             },
         );
+    }
+
+    /// Escalate a pending escrow to the configured dispute-resolution contract.
+    ///
+    /// Either the escrow sender or recipient may open a dispute — this is the
+    /// sender's recourse when the agent has confirmed delivery but has not
+    /// released funds (and `cancel_escrow` is therefore blocked).
+    ///
+    /// The full remaining escrow balance is transferred to the dispute-resolution
+    /// contract, which takes custody of it for arbitration. The escrow is then
+    /// marked `UnderDispute` and can no longer be released, cancelled, deposited
+    /// into, or expired. The adjudicated winner is paid by the dispute contract.
+    ///
+    /// # Arguments
+    /// * `caller`   — Must be the escrow sender or recipient (auth required).
+    /// * `escrow_id` — The escrow to escalate.
+    ///
+    /// # Returns
+    /// The dispute ID assigned by the dispute-resolution contract.
+    pub fn dispute_escrow(env: Env, caller: Address, escrow_id: u64) -> u64 {
+        caller.require_auth();
+
+        let dispute_contract: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DisputeContractAddress)
+            .expect("Dispute resolution contract not configured");
+
+        let mut escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(escrow_id))
+            .unwrap_or_else(|| panic!("Escrow {} not found", escrow_id));
+
+        if caller != escrow.sender && caller != escrow.recipient {
+            panic!("Only the sender or recipient can dispute escrow");
+        }
+        if escrow.status != EscrowStatus::Pending {
+            panic!("Escrow is not in pending state");
+        }
+
+        let usdc_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcAddress)
+            .expect("Contract not initialized");
+
+        // Checks-Effects-Interactions: mark the escrow BEFORE any external calls.
+        escrow.status = EscrowStatus::UnderDispute;
+        escrow.updated_at = env.ledger().timestamp();
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(escrow_id), &escrow);
+
+        // Hand the full remaining balance over to the dispute-resolution contract,
+        // which holds it in its own custody until the conflict is adjudicated.
+        token::Client::new(&env, &usdc_address).transfer(
+            &env.current_contract_address(),
+            &dispute_contract,
+            &escrow.amount,
+        );
+
+        // Record the dispute on-chain with the dispute-resolution contract.
+        let dispute_id: u64 = env.invoke_contract::<u64>(
+            &dispute_contract,
+            &Symbol::new(&env, "open_escrow_dispute"),
+            soroban_sdk::vec![
+                &env,
+                env.current_contract_address().into_val(&env),
+                escrow.sender.clone().into_val(&env),
+                escrow.recipient.clone().into_val(&env),
+                escrow.amount.into_val(&env)
+            ],
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "EscrowDisputed"),),
+            EscrowDisputed {
+                escrow_id,
+                dispute_id,
+                opener: caller,
+                amount: escrow.amount,
+            },
+        );
+
+        dispute_id
     }
 
     pub fn partial_release(env: Env, agent: Address, escrow_id: u64, amount: i128) {
@@ -1030,6 +1131,21 @@ impl EscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::KycContractAddress, &kyc_contract);
+    }
+
+    /// Set the dispute-resolution contract address. Only admin may call this.
+    pub fn set_dispute_contract(env: Env, admin: Address, dispute_contract: Address) {
+        require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeContractAddress, &dispute_contract);
+    }
+
+    /// Get the dispute-resolution contract address, or None if not set.
+    pub fn get_dispute_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeContractAddress)
     }
 
     /// Get the KYC contract address, or None if not set.
