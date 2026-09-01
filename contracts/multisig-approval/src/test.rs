@@ -948,3 +948,52 @@ fn test_execute_with_signatures_rejects_expired_proposal() {
     let sigs: soroban_sdk::Vec<(Address, soroban_sdk::BytesN<64>)> = soroban_sdk::Vec::new(&env);
     client.execute_with_signatures(&id, &sigs);
 }
+
+// ── SC-020: propose_signer_change is reachable as a proper impl method ────────
+//
+// cleanup_expired previously lacked its closing brace, which orphaned
+// propose_signer_change and everything below it outside the impl block —
+// a hard compile error.  This test directly invokes propose_signer_change
+// so that any regression of that structural bug surfaces immediately as a
+// compile failure rather than a silent omission.
+
+#[test]
+fn test_propose_signer_change_is_callable_as_impl_method() {
+    // Arrange: 3 approvers, quorum 2.
+    let (env, contract_id, _, admin) = setup(2, 3);
+    let client = MultisigContractClient::new(&env, &contract_id);
+    let new_signer = Address::generate(&env);
+
+    // Act: call propose_signer_change directly.
+    // If cleanup_expired's closing brace is missing, this line will not compile.
+    client.propose_signer_change(&RotationAction::Add, &new_signer);
+
+    // Assert: rotation is pending — advance past the 72-hour time-lock and execute.
+    env.ledger().with_mut(|l| l.timestamp += ROTATION_DELAY + 1);
+    client.execute_signer_change();
+
+    // Verify the new signer is now in the approvers list by having them vote.
+    let tx_id = propose(&env, &contract_id, &new_signer);
+    assert_eq!(client.get_proposal(&tx_id).approvals, 0); // they proposed, not voted yet
+}
+
+#[test]
+fn test_propose_signer_change_remove_is_callable_as_impl_method() {
+    // Mirror of the Add test but exercises the Remove path, confirming the
+    // entire signer-rotation block is inside the impl (not orphaned).
+    let (env, contract_id, approvers, _) = setup(2, 3);
+    let client = MultisigContractClient::new(&env, &contract_id);
+    // 3 approvers, quorum 2 → removing one leaves 2, still meets quorum.
+    let to_remove = approvers.get(2).unwrap();
+
+    client.propose_signer_change(&RotationAction::Remove, &to_remove);
+
+    env.ledger().with_mut(|l| l.timestamp += ROTATION_DELAY + 1);
+    client.execute_signer_change();
+
+    // After removal, the remaining two approvers can still reach quorum.
+    let tx_id = propose(&env, &contract_id, &approvers.get(0).unwrap());
+    client.approve(&approvers.get(0).unwrap(), &tx_id);
+    client.approve(&approvers.get(1).unwrap(), &tx_id);
+    assert_eq!(client.get_proposal(&tx_id).status, TxStatus::Executed);
+}
