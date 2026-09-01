@@ -1158,6 +1158,11 @@ async function revokeDeviceTrust(req, res, next) {
   try {
     res.clearCookie(DEVICE_COOKIE_NAME, { ...DEVICE_COOKIE_OPTIONS, maxAge: undefined });
     res.json({ message: 'Device trust revoked' });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WebAuthn / biometric credentials (#953)
 //
