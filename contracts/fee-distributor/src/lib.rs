@@ -20,6 +20,15 @@ use soroban_sdk::{
 
 mod test;
 
+// ── Constants ─────────────────────────────────────────────────────────────────
+
+// SECURITY: i128 max is ~170 trillion USDC in stroops.
+// MAX_DEPOSIT_AMOUNT caps a single deposit at 1,000,000 USDC (10_000_000_000_000 stroops),
+// consistent with the MAX_ESCROW_AMOUNT ceiling in escrow.rs.  This provides a
+// contract-level backstop against caller-side unit/precision bugs (e.g. a
+// decimal-precision mismatch depositing an amount 10,000× too large).
+const MAX_DEPOSIT_AMOUNT: i128 = 10_000_000_000_000;
+
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -170,6 +179,9 @@ impl FeeDistributorContract {
         if amount <= 0 {
             panic!("amount must be positive");
         }
+        if amount > MAX_DEPOSIT_AMOUNT {
+            panic!("amount exceeds maximum deposit limit");
+        }
 
         if env.storage().persistent().get(&DataKey::Paused).unwrap_or(false) {
             panic!("Contract is paused");
@@ -233,12 +245,22 @@ impl FeeDistributorContract {
             .unwrap_or(0)
     }
 
-    /// Return all non-zero per-token platform-treasury accumulators.
+    /// Return all non-zero per-token platform-treasury accumulators, paginated.
     ///
-    /// Returns a `Vec` of `(token_address, accumulated_amount)` pairs for every
-    /// token that has ever had a deposit. Entries with a zero balance are
-    /// included (the accumulator may have been fully withdrawn).
-    pub fn get_all_accumulated_fees(env: Env) -> Vec<(Address, i128)> {
+    /// Returns a `Vec` of `(token_address, accumulated_amount)` pairs for tokens
+    /// in the `TokenList` starting at index `start` (0-based), returning at most
+    /// `limit` results (capped at 100 per call — the same ceiling used by
+    /// `agent-escrow::get_registered_agents`).  Only entries with a non-zero
+    /// platform balance are included in the result; callers should advance
+    /// `start` by the number of tokens *examined* (i.e. the raw `TokenList`
+    /// slice size), not by the number of items returned.  Use
+    /// `get_token_list_len` to determine when you have reached the end.
+    ///
+    /// # Arguments
+    /// * `start` — 0-based index into the raw `TokenList`.
+    /// * `limit` — Maximum tokens to examine in this call (capped at 100).
+    pub fn get_all_accumulated_fees(env: Env, start: u32, limit: u32) -> Vec<(Address, i128)> {
+        let cap: u32 = if limit > 100 { 100 } else { limit };
         let list: Vec<Address> = env
             .storage()
             .persistent()
@@ -246,17 +268,34 @@ impl FeeDistributorContract {
             .unwrap_or_else(|| vec![&env]);
 
         let mut result: Vec<(Address, i128)> = Vec::new(&env);
-        for token in list.iter() {
+        let len = list.len();
+        let mut i = start;
+        while i < len && (i - start) < cap {
+            let token = list.get(i).unwrap();
             let bal: i128 = env
                 .storage()
                 .persistent()
                 .get(&DataKey::AccumulatedFees(token.clone()))
                 .unwrap_or(0);
             if bal > 0 {
-                result.push_back((token.clone(), bal));
+                result.push_back((token, bal));
             }
+            i += 1;
         }
         result
+    }
+
+    /// Return the total number of distinct tokens ever deposited.
+    /// Use this with `get_all_accumulated_fees` to know when pagination is
+    /// complete: keep calling with increasing `start` until
+    /// `start >= get_token_list_len()`.
+    pub fn get_token_list_len(env: Env) -> u32 {
+        let list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TokenList)
+            .unwrap_or_else(|| vec![&env]);
+        list.len()
     }
 
     /// Return the agent-reward-pool fees accumulated for a specific token.
