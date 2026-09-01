@@ -736,9 +736,11 @@ impl EscrowContract {
             .set(&DataKey::RetentionPeriodSecs, &retention_secs);
     }
 
-    pub fn cleanup_escrow(env: Env, admin: Address, escrow_id: u64) {
-        require_admin(&env, &admin);
-
+    /// Permissionless cleanup of released/cancelled escrows past the retention
+    /// period, callable by anyone to reclaim storage rent. Mirrors the
+    /// permissionless `expire_escrow` pattern to avoid adding a snooping burden
+    /// on the admin as escrow volume grows.
+    pub fn cleanup_escrow(env: Env, escrow_id: u64) {
         let escrow: Escrow = env
             .storage()
             .persistent()

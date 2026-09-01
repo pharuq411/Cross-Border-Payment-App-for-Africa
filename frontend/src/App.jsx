@@ -52,6 +52,10 @@ function PrivateRoute({ children }) {
     sessionStorage.setItem('afripay_redirect', location.pathname + location.search);
     return <Navigate to="/login" replace />;
   }
+  // Onboarding is a per-account prerequisite — incomplete users must finish it first.
+  if (user.onboarding_completed === false) {
+    return <Navigate to="/" replace />;
+  }
   return children;
 }
 
@@ -59,6 +63,18 @@ function PublicRoute({ children }) {
   const { user, loading } = useAuth();
   if (loading) return null;
   return user ? <Navigate to="/dashboard" replace /> : children;
+}
+
+// Route for the Welcome/onboarding screen: shown to logged-out visitors and to
+// logged-in users whose account hasn't completed onboarding yet. Users who have
+// completed onboarding are sent straight to the dashboard.
+function OnboardingRoute({ children }) {
+  const { user, loading } = useAuth();
+  if (loading) return null;
+  if (user && user.onboarding_completed !== false) {
+    return <Navigate to="/dashboard" replace />;
+  }
+  return children;
 }
 
 function AppRoutes() {
@@ -70,9 +86,9 @@ function AppRoutes() {
         <Route
           path="/"
           element={
-            <PublicRoute>
+            <OnboardingRoute>
               <Welcome />
-            </PublicRoute>
+            </OnboardingRoute>
           }
         />
         <Route
