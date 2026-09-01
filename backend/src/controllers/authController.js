@@ -194,7 +194,7 @@ async function login(req, res, next) {
     const result = await db.query(
       `SELECT u.id, u.full_name, u.email, u.password_hash, u.email_verified, u.role,
               u.totp_enabled, u.totp_secret, u.failed_login_attempts, u.locked_until,
-              u.last_failed_attempt_at, w.public_key
+              u.last_failed_attempt_at, u.onboarding_completed, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.email = $1`,
       [email]
@@ -294,10 +294,8 @@ async function login(req, res, next) {
     // Check if 2FA is enabled
     if (user.totp_enabled) {
       const { totp_code: totpCode, backup_code } = req.body;
-      if (!totpCode && !backup_code) {
-        return res.status(403).json({ error: 'TOTP code required', requires_2fa: true });
-      }
 
+      // Backup codes can be used in place of TOTP
       if (backup_code) {
         const codes = await db.query(
           `SELECT id, code_hash FROM totp_backup_codes WHERE user_id = $1 AND used_at IS NULL`,
@@ -379,6 +377,7 @@ async function login(req, res, next) {
         email: user.email,
         wallet_address: user.public_key,
         phone_verified: user.phone_verified,
+        onboarding_completed: user.onboarding_completed,
       },
     });
   } catch (err) {
@@ -479,7 +478,7 @@ async function verifyPhone(req, res, next) {
 async function getMe(req, res, next) {
   try {
     const result = await db.query(
-      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, u.avatar_url, w.public_key
+      `SELECT u.id, u.full_name, u.email, u.email_verified, u.phone, u.phone_verified, u.pin_setup_completed, u.totp_enabled, u.account_type, u.avatar_url, u.onboarding_completed, w.public_key
        FROM users u LEFT JOIN wallets w ON w.user_id = u.id
        WHERE u.id = $1`,
       [req.user.userId]
@@ -498,6 +497,7 @@ async function getMe(req, res, next) {
       totp_enabled: u.totp_enabled,
       account_type: u.account_type,
       avatar_url: u.avatar_url || null,
+      onboarding_completed: u.onboarding_completed,
     });
   } catch (err) {
     next(err);
@@ -1066,6 +1066,17 @@ async function getActivity(req, res, next) {
       [req.user.userId]
     );
     res.json({ activity: result.rows });
+  } catch (err) {
+    next(err);
+  }
+}
+
+async function completeOnboarding(req, res, next) {
+  try {
+    const userId = req.user.userId;
+    await db.query('UPDATE users SET onboarding_completed = TRUE WHERE id = $1', [userId]);
+    audit.log(userId, 'onboarding_completed', req.ip, req.headers['user-agent']);
+    res.json({ message: 'Onboarding completed' });
   } catch (err) {
     next(err);
   }

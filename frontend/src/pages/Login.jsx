@@ -77,6 +77,12 @@ export default function Login() {
       const redirectParam = searchParams.get('redirect');
       const redirect = redirectParam || sessionStorage.getItem('afripay_redirect');
       sessionStorage.removeItem('afripay_redirect');
+      // Onboarding completion is per-account — users who haven't completed it
+      // are routed through the Welcome screen before reaching the app.
+      if (result.user?.onboarding_completed === false) {
+        navigate('/');
+        return;
+      }
       navigate(redirect || '/dashboard');
     } catch (err) {
       const data = err.response?.data;

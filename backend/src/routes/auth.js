@@ -128,6 +128,7 @@ router.post(
 );
 router.get('/verify-email-change', verifyEmailChange);
 router.get('/activity', authMiddleware, getActivity);
+router.post('/onboarding-completed', authMiddleware, completeOnboarding);
 
 router.post(
   '/set-pin',
