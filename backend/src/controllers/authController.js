@@ -945,7 +945,7 @@ async function validateResetToken(req, res, next) {
 
 async function updateProfile(req, res, next) {
   try {
-    const { full_name, phone } = req.body;
+    const { full_name, phone, preferred_language } = req.body;
     const userId = req.user.userId;
 
     const oldUserResult = await db.query('SELECT phone FROM users WHERE id = $1', [userId]);
@@ -962,15 +962,23 @@ async function updateProfile(req, res, next) {
       phoneVerified = false;
     }
 
+    // Validate preferred_language if provided
+    const ALLOWED_LOCALES = ['en', 'sw', 'fr', 'ha', 'yo'];
+    const sanitizedLocale =
+      preferred_language && ALLOWED_LOCALES.includes(preferred_language)
+        ? preferred_language
+        : null;
+
     await db.query(
       `UPDATE users SET
         full_name = COALESCE($1, full_name),
         phone = COALESCE($2, phone),
         phone_verified = COALESCE($3, phone_verified),
         phone_otp_hash = COALESCE($4, phone_otp_hash),
-        phone_otp_expires_at = COALESCE($5, phone_otp_expires_at)
-      WHERE id = $6`,
-      [full_name || null, phone || null, phoneVerified, otpHashed, otpExpiresAt, userId]
+        phone_otp_expires_at = COALESCE($5, phone_otp_expires_at),
+        preferred_language = COALESCE($6, preferred_language)
+      WHERE id = $7`,
+      [full_name || null, phone || null, phoneVerified, otpHashed, otpExpiresAt, sanitizedLocale, userId]
     );
 
     if (otpRaw && phone) {
