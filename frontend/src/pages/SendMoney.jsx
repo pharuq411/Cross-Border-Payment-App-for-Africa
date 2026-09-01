@@ -24,6 +24,7 @@ import XDRInspectorModal from '../components/XDRInspectorModal';
 import LedgerSignModal from '../components/LedgerSignModal';
 import PushNotificationPrompt from '../components/PushNotificationPrompt';
 import { usePushNotifications } from '../hooks/usePushNotifications';
+import { usePaymentStream, CONNECTION_STATE } from '../hooks/usePaymentStream';
 
 const SLIPPAGE_OPTIONS = [0.5, 1, 2];
 const DEFAULT_SLIPPAGE = 1;
@@ -99,6 +100,11 @@ export default function SendMoney() {
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [showPushPrompt, setShowPushPrompt] = useState(false);
   const { shouldShowPrompt } = usePushNotifications();
+
+  // Stream real-time payment status updates for the active wallet.
+  // Surfacing connectionState lets step 4 show a reconnecting indicator so the
+  // user isn't looking at a silently-stale status view.
+  const { connectionState } = usePaymentStream(selectedWallet?.public_key ?? null, () => {});
 
   // Pre-fill form from payment request when only requestId is in the URL
   useEffect(() => {
@@ -1505,6 +1511,33 @@ export default function SendMoney() {
         {/* ── STEP 4: Authenticate ── */}
         {step === 4 && (
           <div className="space-y-4">
+            {/* Reconnecting indicator: shown when the payment status stream drops */}
+            {connectionState === CONNECTION_STATE.RECONNECTING && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="flex items-center gap-2 bg-yellow-500/10 border border-yellow-500/40 rounded-xl px-4 py-2.5 text-yellow-400 text-xs"
+              >
+                <span
+                  className="w-2 h-2 rounded-full bg-yellow-400 animate-pulse shrink-0"
+                  aria-hidden="true"
+                />
+                Reconnecting to payment status stream…
+              </div>
+            )}
+            {connectionState === CONNECTION_STATE.DISCONNECTED && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="flex items-center gap-2 bg-red-500/10 border border-red-500/40 rounded-xl px-4 py-2.5 text-red-400 text-xs"
+              >
+                <span
+                  className="w-2 h-2 rounded-full bg-red-400 shrink-0"
+                  aria-hidden="true"
+                />
+                Payment status stream disconnected — status may be delayed
+              </div>
+            )}
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 space-y-1">
               <p className="text-white font-semibold">Authorize Payment</p>
               <p className="text-gray-400 text-sm">
