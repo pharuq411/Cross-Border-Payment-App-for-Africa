@@ -3,6 +3,7 @@ import api from '../utils/api';
 
 const VAPID_PUBLIC_KEY = process.env.REACT_APP_VAPID_PUBLIC_KEY;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+const DISMISSED_KEY = 'notifications_dismissed';
 
 function urlBase64ToUint8Array(base64String) {
   const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
@@ -45,6 +46,10 @@ export function usePushNotifications() {
   }, []);
 
   const shouldShowPrompt = useCallback(() => {
+    if (permissionStatus !== 'default') return false;
+    // Durable opt-out: once the user says "don't ask again", never re-prompt.
+    if (localStorage.getItem(DISMISSED_KEY) === 'true') return false;
+    // Otherwise, only re-prompt once the 7-day deferral has fully elapsed.
     if (permissionStatus === 'denied') return false;
     if (permissionStatus === 'granted') return needsResubscribe;
     const deferred = localStorage.getItem('notifications_deferred');
