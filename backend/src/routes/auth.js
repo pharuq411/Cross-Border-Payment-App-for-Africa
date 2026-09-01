@@ -1,7 +1,6 @@
 const router = require('express').Router();
 const { body, validationResult } = require('express-validator');
 const multer = require('multer');
-const { register, login, verifyEmail, getMe, setPIN, verifyPIN } = require('../controllers/authController');
 const {
   register,
   login,
@@ -9,16 +8,31 @@ const {
   logout,
   verifyEmail,
   verifyPhone,
+  getMe,
   updateProfile,
   changeEmail,
   verifyEmailChange,
   getActivity,
   uploadAvatar,
+  setPIN,
+  verifyPIN,
+  registerBiometric,
+  getBiometricStatus,
+  disableBiometric,
   setup2FA,
   verify2FA,
   disable2FA,
   forgotPassword,
   resetPassword,
+  regenerateBackupCodes,
+  getBackupCodeCount,
+  changePassword,
+  validateResetToken,
+  revokeDeviceTrust,
+  webauthnRegisterOptions,
+  webauthnRegister,
+  webauthnLoginOptions,
+  webauthnVerify,
 } = require('../controllers/authController');
 const authMiddleware = require('../middleware/auth');
 const geoRestriction = require('../middleware/geoRestriction');
@@ -91,6 +105,8 @@ router.post(
   resetPassword
 );
 
+router.get('/reset-password/validate', validateResetToken);
+
 router.post('/refresh', verifyCsrf, refresh);
 router.post('/logout', verifyCsrf, logout);
 
@@ -133,6 +149,27 @@ router.post(
   verifyPIN
 );
 
+router.post(
+  '/biometric/register',
+  authMiddleware,
+  [
+    body('credential_id').notEmpty().withMessage('credential_id is required'),
+    body('device_label').optional().isString().trim(),
+  ],
+  validate,
+  registerBiometric
+);
+
+router.get('/biometric/status', authMiddleware, getBiometricStatus);
+
+router.post(
+  '/biometric/disable',
+  authMiddleware,
+  [body('credential_id').optional().isString()],
+  validate,
+  disableBiometric
+);
+
 router.post('/2fa/setup', authMiddleware, setup2FA);
 
 router.post(
@@ -151,6 +188,16 @@ router.post(
   disable2FA
 );
 
+router.post(
+  '/2fa/backup-codes/regenerate',
+  authMiddleware,
+  [body('totp_code').matches(/^\d{6}$/).withMessage('TOTP code must be 6 digits')],
+  validate,
+  regenerateBackupCodes
+);
+
+router.get('/2fa/backup-codes/count', authMiddleware, getBackupCodeCount);
+
 // Avatar upload — 5 MB limit, memory storage (magic bytes checked in controller)
 const avatarUpload = multer({
   storage: multer.memoryStorage(),
@@ -161,6 +208,18 @@ const avatarUpload = multer({
   },
 });
 
+// Change password — invalidates all other active sessions
+router.patch(
+  '/password',
+  authMiddleware,
+  [
+    body('current_password').notEmpty().withMessage('Current password is required'),
+    body('new_password').isLength({ min: 8 }).withMessage('New password must be at least 8 characters'),
+  ],
+  validate,
+  changePassword
+);
+
 router.post(
   '/avatar',
   authMiddleware,
@@ -168,9 +227,23 @@ router.post(
   uploadAvatar
 );
 
+// WebAuthn / biometric credentials
+router.post('/webauthn/register/options', authMiddleware, webauthnRegisterOptions);
+router.post('/webauthn/register', authMiddleware, webauthnRegister);
+router.post(
+  '/webauthn/verify/options',
+  [body('email').isEmail().normalizeEmail()],
+  validate,
+  webauthnLoginOptions
+);
+router.post('/webauthn/verify', webauthnVerify);
+
 // Session management
 router.get('/sessions', authMiddleware, listSessions);
 router.delete('/sessions', authMiddleware, revokeAllSessions);
 router.delete('/sessions/:id', authMiddleware, revokeSession);
+
+// Device trust (issue #995) — clears the httpOnly device-trust cookie.
+router.delete('/device-trust', authMiddleware, revokeDeviceTrust);
 
 module.exports = router;

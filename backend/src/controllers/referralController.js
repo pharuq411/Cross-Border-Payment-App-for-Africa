@@ -1,4 +1,6 @@
 const db = require('../db');
+const { detectReferralAbuse } = require('../services/referralAbuseGuard');
+const logger = require('../utils/logger');
 
 const REFERRAL_CREDIT_BPS = parseInt(process.env.REFERRAL_CREDIT_BPS || '50', 10); // 0.5% fee discount
 const REFERRAL_EXPIRY_DAYS = 90;
@@ -25,12 +27,21 @@ async function getStats(req, res, next) {
       [userId]
     );
 
+    const rewardsResult = await db.query(
+      `SELECT COUNT(*) FILTER (WHERE status = 'credited') AS first_payments_completed,
+              COALESCE(SUM(reward_amount) FILTER (WHERE status = 'credited'), 0) AS total_rewards_earned
+       FROM referral_rewards WHERE referrer_id = $1`,
+      [userId]
+    );
+
     res.json({
       referral_code,
       referral_count: parseInt(referralsResult.rows[0].referral_count, 10),
       total_credits_bps: parseInt(creditsResult.rows[0].total_bps, 10),
       active_credits: parseInt(creditsResult.rows[0].active_credits, 10),
       credit_per_referral_bps: REFERRAL_CREDIT_BPS,
+      first_payments_completed: parseInt(rewardsResult.rows[0].first_payments_completed, 10),
+      total_rewards_earned: parseInt(rewardsResult.rows[0].total_rewards_earned, 10),
     });
   } catch (err) {
     next(err);
@@ -52,6 +63,15 @@ async function awardReferralCredit(referredUserId) {
   if (!result.rows[0]) return;
 
   const referrerId = result.rows[0].referrer_id;
+
+  // Reject self-referral and circular referral chains before crediting
+  const abuseReason = await detectReferralAbuse(referrerId, referredUserId);
+  if (abuseReason) {
+    logger.warn('Referral credit withheld — abuse check failed', {
+      referrerId, referredUserId, reason: abuseReason,
+    });
+    return;
+  }
 
   // Only award once per referred user
   const existing = await db.query(

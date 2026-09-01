@@ -33,19 +33,27 @@ const webpush = require('./services/webpush');
 const db = require('./db');
 const app = require('./app');
 const { initStreams } = require('./services/horizonWorker');
-const { detectTestnetReset } = require('./services/stellar');
+const { detectTestnetReset, startFallbackDurationMonitor } = require('./services/stellar');
+const { initEmailQueue, drainEmailQueue } = require('./services/email');
+const { startPriceRefreshJob } = require('./services/priceOracle');
+const { syncOfferEvents } = require('./jobs/syncOfferEvents');
 const ledgerListener = require('./services/ledgerListener');
 const { Server: SocketIOServer } = require('socket.io');
 const jwt = require('jsonwebtoken');
 const { startScheduler } = require('./scheduler');
+const { setSocketIO } = require('./services/notificationInbox');
 
 const PORT = process.env.PORT || 5000;
 const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+initEmailQueue();
+startPriceRefreshJob();
 
 const server = app.listen(PORT, () => {
   logger.info(`Server running on port ${PORT}`, { port: PORT });
   initStreams();
   startScheduler();
+  startFallbackDurationMonitor(); // BE-036: alert if Horizon fallback stays active too long
 
   // Warn if testnet was reset since last startup
   if (process.env.NODE_ENV !== 'production') {
@@ -97,6 +105,7 @@ io.on('connection', async (socket) => {
 
 ledgerListener.setSocketIO(io);
 ledgerListener.initStreams();
+setSocketIO(io);
 
 async function shutdown(signal) {
   logger.info(`${signal} received — shutting down gracefully`);
@@ -108,6 +117,12 @@ async function shutdown(signal) {
 
   server.close(async () => {
     clearTimeout(forceExit);
+    try {
+      await drainEmailQueue();
+      logger.info('Email queue drained');
+    } catch (err) {
+      logger.error('Error draining email queue', { message: err.message });
+    }
     try {
       await db.pool.end();
       logger.info('DB pool closed');
