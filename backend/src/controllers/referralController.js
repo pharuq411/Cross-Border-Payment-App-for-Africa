@@ -47,6 +47,60 @@ async function getStats(req, res, next) {
 }
 
 /**
+ * Get list of referrals with their reward status (pending, credited, failed, ineligible)
+ */
+async function getReferralDetails(req, res, next) {
+  try {
+    const userId = req.user.userId;
+
+    // Get all referred users
+    const referralsResult = await db.query(
+      `SELECT u.id, u.email, u.created_at
+       FROM users u
+       JOIN users referrer ON referrer.id = $1
+       WHERE u.referred_by = referrer.referral_code
+       ORDER BY u.created_at DESC`,
+      [userId]
+    );
+
+    const referrals = referralsResult.rows || [];
+
+    // For each referred user, get their reward status
+    const details = await Promise.all(
+      referrals.map(async (ref) => {
+        const rewardResult = await db.query(
+          `SELECT status, reward_amount, created_at
+           FROM referral_rewards
+           WHERE referee_id = $1`,
+          [ref.id]
+        );
+
+        const reward = rewardResult.rows[0];
+        const status = reward ? reward.status : 'ineligible';
+
+        return {
+          referral_id: ref.id,
+          email: ref.email,
+          referred_at: ref.created_at,
+          reward_status: status,
+          reward_amount: reward ? reward.reward_amount : null,
+          reward_claimed_at: reward ? reward.created_at : null,
+        };
+      })
+    );
+
+    res.json({
+      referrals: details,
+      total_referrals: details.length,
+      pending_rewards: details.filter(r => r.reward_status === 'pending').length,
+      credited_rewards: details.filter(r => r.reward_status === 'credited').length,
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
  * Called after a referred user's first transaction completes.
  * Awards fee-discount credit to the referrer.
  */
@@ -79,8 +133,6 @@ async function awardReferralCredit(referredUserId) {
   );
 }
 
-module.exports = { getStats, awardReferralCredit };
-
 /**
  * POST /api/referrals/award
  * Admin/internal endpoint — awards referral credit for a given referred user.
@@ -99,4 +151,4 @@ async function awardReferralCreditHandler(req, res, next) {
   }
 }
 
-module.exports = { getStats, awardReferralCredit, awardReferralCreditHandler };
+module.exports = { getStats, getReferralDetails, awardReferralCredit, awardReferralCreditHandler };
