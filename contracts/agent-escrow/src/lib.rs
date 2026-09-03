@@ -138,6 +138,10 @@ pub struct InsurancePayout {
     pub escrow_id: u64,
     pub recipient: Address,
     pub amount: i128,
+}
+
+#[derive(Clone)]
+#[contracttype]
 pub struct EvtPartialPayoutReleased {
     pub escrow_id: u64,
     pub agent: Address,
@@ -493,14 +497,6 @@ impl AgentEscrowContract {
                 fee_amount,
             },
         );
-
-        env.events().publish(
-            (Symbol::new(&env, "InsuranceFundContribution"),),
-            InsuranceFundContribution {
-                escrow_id,
-                amount: insurance_contribution,
-            },
-        );
     }
 
     /// Cancel a pending escrow and refund the sender.
@@ -722,12 +718,21 @@ impl AgentEscrowContract {
             .unwrap_or(0)
     }
 
-    /// Admin-only function to payout from the insurance fund to a defrauded recipient.
+    /// Admin-only function to payout from the insurance fund to the defrauded sender.
+    ///
+    /// The referenced escrow **must** be in `Cancelled` status — i.e. the agent
+    /// failed to deliver and the sender was already refunded via `cancel_escrow`,
+    /// or the admin force-cancelled via `admin_release`. Using a `Pending` or
+    /// `Completed` escrow as the `escrow_id` argument is rejected to prevent an
+    /// admin fat-finger (or a compromised key) from draining the fund against an
+    /// unrelated, healthy escrow.
+    ///
+    /// The payout goes to `escrow.sender` — the party who was defrauded — rather
+    /// than an arbitrary caller-supplied recipient address.
     ///
     /// # Arguments
-    /// * `escrow_id` — ID of the escrow that was fraudulent.
-    /// * `recipient` — Address to receive the insurance payout.
-    pub fn insurance_payout(env: Env, escrow_id: u64, recipient: Address) {
+    /// * `escrow_id` — ID of a `Cancelled` escrow that was fraudulent.
+    pub fn insurance_payout(env: Env, escrow_id: u64) {
         let admin: Address = env
             .storage()
             .persistent()
@@ -740,6 +745,13 @@ impl AgentEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(escrow_id))
             .expect("escrow not found");
+
+        // SC-013: only allow payout against a Cancelled escrow — a state that
+        // indicates actual agent non-performance or fraud.  Pending/Completed
+        // escrows have no basis for an insurance claim.
+        if escrow.status != EscrowStatus::Cancelled {
+            panic!("insurance_payout: escrow must be in Cancelled status");
+        }
 
         let insurance_balance: i128 = env
             .storage()
@@ -763,6 +775,10 @@ impl AgentEscrowContract {
             .persistent()
             .get(&DataKey::UsdcAddress)
             .unwrap();
+
+        // SC-013: recipient is locked to the escrow's original sender — the
+        // defrauded party — not an arbitrary caller-supplied address.
+        let recipient = escrow.sender.clone();
 
         token::Client::new(&env, &usdc).transfer(
             &env.current_contract_address(),

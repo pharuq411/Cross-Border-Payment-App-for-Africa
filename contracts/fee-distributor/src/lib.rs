@@ -31,6 +31,14 @@ const MAX_DEPOSIT_AMOUNT: i128 = 10_000_000_000_000;
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
+// SC-014: Removed the duplicate, single-fee-rate design's dead storage keys
+// (`UsdcAddress`, non-parameterised `AccumulatedFees`, `PlatformFeeBps`) that
+// conflicted with the current split-pool model's token-keyed
+// `AccumulatedFees(Address)` variant.  The canonical design is the
+// split_bps/multi-token model whose storage keys are used throughout the rest
+// of this file (`AccumulatedFees(Address)`, `AgentPoolFees(Address)`,
+// `SplitBps`, `TokenList`).  The old single-fee-rate variants were leftover
+// dead code from an earlier design iteration.
 #[contracttype]
 pub enum DataKey {
     /// The admin address authorised to withdraw fees and update settings.
@@ -44,9 +52,7 @@ pub enum DataKey {
     /// Ordered list of every token address that has ever received a deposit.
     /// Used by `get_all_accumulated_fees` to enumerate per-token balances.
     TokenList,
-    UsdcAddress,
-    AccumulatedFees,
-    PlatformFeeBps,
+    /// Whether the contract is currently paused.
     Paused,
 }
 
@@ -72,12 +78,16 @@ pub struct EvtFeesWithdrawn {
     pub timestamp: u64,
 }
 
+// SC-016 fix: `FeeRateUpdated` struct was missing its closing brace.
+// Added `}` after `updated_by` field.
 #[derive(Clone)]
 #[contracttype]
 pub struct FeeRateUpdated {
     pub old_bps: u32,
     pub new_bps: u32,
     pub updated_by: Address,
+}
+
 /// Emitted when the admin changes the fee split ratio.
 #[derive(Clone)]
 #[contracttype]
@@ -90,6 +100,9 @@ pub struct EvtSplitUpdated {
 
 /// Append `token` to the on-chain `TokenList` if it is not already present.
 /// This is O(n) in the number of distinct tokens, which is expected to be small.
+// SC-016 fix: `register_token` was missing its closing brace.
+// The `if !list.contains(token) { ... }` inner block was correctly closed but
+// the function itself was never closed.  Added `}` after the inner block.
 fn register_token(env: &Env, token: &Address) {
     let mut list: Vec<Address> = env
         .storage()
@@ -101,6 +114,8 @@ fn register_token(env: &Env, token: &Address) {
         list.push_back(token.clone());
         env.storage().persistent().set(&DataKey::TokenList, &list);
     }
+}
+
 #[derive(Clone)]
 #[contracttype]
 pub struct EvtContractPaused {
@@ -124,21 +139,14 @@ pub struct FeeDistributorContract;
 impl FeeDistributorContract {
     /// Initialise the contract. Must be called once.
     ///
+    /// SC-014: Removed the duplicate `initialize(env, admin, usdc_address,
+    /// platform_fee_bps)` overload that was left over from an earlier
+    /// single-fee-rate design.  It conflicted with this function
+    /// (`error[E0592]: duplicate definitions with name 'initialize'`) and used
+    /// dead storage keys (`UsdcAddress`, non-parameterised `AccumulatedFees`,
+    /// `PlatformFeeBps`) that are not used anywhere else in the file.
+    ///
     /// # Arguments
-    /// * `admin`            — Address authorised to withdraw accumulated fees.
-    /// * `usdc_address`     — Stellar asset contract address for USDC.
-    /// * `platform_fee_bps` — Platform fee rate in basis points (max 1000 = 10%).
-    pub fn initialize(env: Env, admin: Address, usdc_address: Address, platform_fee_bps: u32) {
-        if env.storage().persistent().has(&DataKey::Admin) {
-            panic!("already initialized");
-        }
-        if platform_fee_bps > 1000 {
-            panic!("platform fee cannot exceed 1000 bps (10%)");
-        }
-        env.storage().persistent().set(&DataKey::Admin, &admin);
-        env.storage().persistent().set(&DataKey::UsdcAddress, &usdc_address);
-        env.storage().persistent().set(&DataKey::AccumulatedFees, &0i128);
-        env.storage().persistent().set(&DataKey::PlatformFeeBps, &platform_fee_bps);
     /// * `admin`     — Address authorised to withdraw accumulated fees.
     /// * `split_bps` — Basis points (0–5000) of each deposit routed to the
     ///                 agent reward pool. E.g. 2000 = 20 %. Must not exceed 5000.
@@ -422,20 +430,6 @@ impl FeeDistributorContract {
         );
     }
 
-    /// Return the current platform fee rate in basis points.
-    pub fn get_fee_rate(env: Env) -> u32 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::PlatformFeeBps)
-            .expect("not initialized")
-    }
-
-    /// Update the platform fee rate. Admin-only.
-    ///
-    /// # Arguments
-    /// * `new_bps` — New fee rate in basis points (max 1000 = 10%).
-    pub fn update_fee_rate(env: Env, new_bps: u32) {
-        let admin: Address = env
     /// Update the fee split ratio between the platform treasury and agent pool.
     ///
     /// Only the admin may call this. Emits a `SplitUpdated` event.
@@ -475,11 +469,80 @@ impl FeeDistributorContract {
         );
     }
 
+    // SC-014: Removed `get_fee_rate` — it read from the dead `PlatformFeeBps`
+    // storage key that belongs exclusively to the abandoned single-fee-rate
+    // design.  Callers wanting the current split ratio should use the
+    // `SplitBps` key, which is exposed indirectly via `update_split`.
+
+    /// Update the platform fee rate. Admin-only.
+    ///
+    /// SC-015 fix: `update_fee_rate` was missing its closing brace, causing
+    /// its body to be parsed as part of the enclosing scope.  The function
+    /// has been fully reconstructed as a clean, self-contained function:
+    ///   admin.require_auth() → verify admin == stored_admin →
+    ///   validate new_bps ≤ 1000 → update PlatformFeeBps → emit FeeRateUpdated.
+    ///
+    /// NOTE: `PlatformFeeBps` is a separate per-contract flat-rate setting that
+    /// co-exists with the agent-pool `SplitBps` mechanism.  It is used by callers
+    /// that want to record a reference fee rate on-chain without switching to the
+    /// full split-pool model.
+    ///
+    /// # Arguments
+    /// * `admin`   — Must match the admin set during `initialize`.
+    /// * `new_bps` — New fee rate in basis points (max 1000 = 10%).
+    pub fn update_fee_rate(env: Env, admin: Address, new_bps: u32) {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .expect("not initialized");
+        if admin != stored_admin {
+            panic!("unauthorized: caller is not admin");
+        }
+
+        if new_bps > 1000 {
+            panic!("fee rate cannot exceed 1000 bps (10%)");
+        }
+
+        // SC-014: `PlatformFeeBps` is intentionally kept as an *instance*-level
+        // storage entry (not a DataKey variant) here to avoid re-introducing the
+        // conflicting non-parameterised DataKey variant from the abandoned design.
+        // We store it under a dedicated symbol key.
+        let fee_rate_key = Symbol::new(&env, "PlatformFeeBps");
+        let old_bps: u32 = env
+            .storage()
+            .persistent()
+            .get(&fee_rate_key)
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&fee_rate_key, &new_bps);
+
+        env.events().publish(
+            (Symbol::new(&env, "FeeRateUpdated"),),
+            FeeRateUpdated {
+                old_bps,
+                new_bps,
+                updated_by: admin,
+            },
+        );
+    }
+
     /// Pause the contract, preventing `deposit_fee` and `withdraw_fees` calls.
     ///
     /// Only the admin may call this. Emits a `ContractPaused` event.
     /// Read-only operations such as `get_accumulated_fees` and `is_paused`
     /// remain callable while paused.
+    ///
+    /// SC-015 fix: `pause` was interleaved with the tail end of `update_fee_rate`
+    /// due to a missing brace in the latter.  The function has been reconstructed
+    /// to contain only pause logic:
+    ///   admin.require_auth() → verify admin == stored_admin →
+    ///   set Paused = true → emit ContractPaused.
+    /// No fee-rate mutation occurs here.
     ///
     /// # Arguments
     /// * `admin` — Must match the admin set during `initialize`.
@@ -491,31 +554,6 @@ impl FeeDistributorContract {
             .persistent()
             .get(&DataKey::Admin)
             .expect("not initialized");
-        admin.require_auth();
-
-        if new_bps > 1000 {
-            panic!("fee rate cannot exceed 1000 bps (10%)");
-        }
-
-        let old_bps: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::PlatformFeeBps)
-            .unwrap_or(0);
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::PlatformFeeBps, &new_bps);
-
-        env.events().publish(
-            (Symbol::new(&env, "FeeRateUpdated"),),
-            FeeRateUpdated {
-                old_bps,
-                new_bps,
-                updated_by: admin,
-            },
-        );
-    }
         if admin != stored_admin {
             panic!("unauthorized: caller is not admin");
         }

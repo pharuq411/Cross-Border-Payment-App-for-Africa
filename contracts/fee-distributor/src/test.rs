@@ -7,8 +7,8 @@ use soroban_sdk::{
 };
 
 use crate::{
-    EvtFeeDeposited, EvtFeesWithdrawn, EvtSplitUpdated, FeeDistributorContract,
-    FeeDistributorContractClient,
+    EvtContractPaused, EvtContractUnpaused, EvtFeeDeposited, EvtFeesWithdrawn, EvtSplitUpdated,
+    FeeDistributorContract, FeeDistributorContractClient, FeeRateUpdated,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

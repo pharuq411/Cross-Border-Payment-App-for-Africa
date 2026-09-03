@@ -8,7 +8,7 @@ use soroban_sdk::{
 
 use crate::{
     AdminOverride, AgentEscrowContract, AgentEscrowContractClient, EscrowStatus,
-    EvtEscrowCancelled, EvtEscrowConfirmed, EvtEscrowCreated,
+    EvtEscrowCancelled, EvtEscrowConfirmed, EvtEscrowCreated, InsurancePayout,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -558,7 +558,186 @@ fn test_create_escrow_emits_escrow_created_event() {
 
 #[test]
 fn test_confirm_payout_emits_escrow_confirmed_event() {
-// ── partial_confirm_payout ────────────────────────────────────────────────────
+// ── insurance_payout (SC-013) ─────────────────────────────────────────────────
+
+/// Helper: build up an insurance fund balance by confirming a payout.
+/// Returns the insurance balance after confirmation (a portion of the fee).
+fn fund_insurance(
+    env: &Env,
+    client: &AgentEscrowContractClient,
+    usdc_id: &Address,
+    admin: &Address,
+    amount: i128,
+    fee_bps: u32,
+) -> (Address, Address, Address, u64) {
+    let (sender, recipient, agent, id) = make_escrow(env, client, usdc_id, admin, amount, fee_bps);
+    client.confirm_payout(&agent, &id);
+    (sender, recipient, agent, id)
+}
+
+#[test]
+#[should_panic(expected = "insurance_payout: escrow must be in Cancelled status")]
+fn test_insurance_payout_rejected_for_pending_escrow() {
+    // SC-013: a Pending escrow has no basis for an insurance claim.
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let (_, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 500);
+    // Escrow is still Pending — insurance_payout must panic.
+    client.insurance_payout(&id);
+}
+
+#[test]
+#[should_panic(expected = "insurance_payout: escrow must be in Cancelled status")]
+fn test_insurance_payout_rejected_for_completed_escrow() {
+    // SC-013: a Completed escrow means the agent delivered — no fraud claim.
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 500u32;
+    // confirm_payout → Completed, which also builds the insurance fund.
+    let (_, _, agent, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.confirm_payout(&agent, &id);
+    // Escrow is now Completed — insurance_payout must panic.
+    client.insurance_payout(&id);
+}
+
+#[test]
+fn test_insurance_payout_succeeds_on_cancelled_escrow() {
+    // SC-013: happy path — cancelled escrow (agent non-performance) can receive
+    // insurance payout.  Payout goes to the original sender.
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 1_000_0000000i128;
+    let fee_bps = 500u32;
+
+    // First, build up the insurance fund by completing a separate escrow.
+    let (_, _, agent_fund, id_fund) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.confirm_payout(&agent_fund, &id_fund);
+
+    let insurance_before = client.get_insurance_balance();
+    assert!(insurance_before > 0, "insurance fund must be non-zero before payout test");
+
+    // Create a second escrow and cancel it (simulate agent non-performance).
+    let (sender_victim, _, _, id_victim) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.cancel_escrow(&sender_victim, &id_victim);
+
+    // Capture sender balance after cancel (they already got their full refund).
+    let sender_balance_before =
+        TokenClient::new(&env, &usdc_id).balance(&sender_victim);
+
+    // Insurance payout should succeed and go to sender_victim.
+    client.insurance_payout(&id_victim);
+
+    let insurance_after = client.get_insurance_balance();
+    let sender_balance_after =
+        TokenClient::new(&env, &usdc_id).balance(&sender_victim);
+
+    // Payout amount is min(escrow.amount, insurance_balance).
+    let expected_payout = if amount <= insurance_before {
+        amount
+    } else {
+        insurance_before
+    };
+
+    assert_eq!(
+        insurance_after,
+        insurance_before - expected_payout,
+        "insurance fund must be reduced by payout amount"
+    );
+    assert_eq!(
+        sender_balance_after,
+        sender_balance_before + expected_payout,
+        "payout must be credited to the escrow's original sender"
+    );
+}
+
+#[test]
+fn test_insurance_payout_recipient_is_escrow_sender_not_arbitrary() {
+    // SC-013: verify the function signature no longer accepts an arbitrary
+    // recipient — payout goes to escrow.sender automatically.
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 500_0000000i128;
+    let fee_bps = 500u32;
+
+    // Build insurance fund.
+    let (_, _, agent_fund, id_fund) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.confirm_payout(&agent_fund, &id_fund);
+
+    // Create and cancel a victim escrow.
+    let (sender_victim, _, _, id_victim) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.cancel_escrow(&sender_victim, &id_victim);
+
+    // Collect a bystander's balance before the payout.
+    let bystander = Address::generate(&env);
+    let bystander_before = TokenClient::new(&env, &usdc_id).balance(&bystander);
+
+    client.insurance_payout(&id_victim);
+
+    // Bystander must not receive anything.
+    assert_eq!(
+        TokenClient::new(&env, &usdc_id).balance(&bystander),
+        bystander_before,
+        "bystander must not receive insurance payout"
+    );
+    // Sender must receive the payout.
+    assert!(
+        TokenClient::new(&env, &usdc_id).balance(&sender_victim) > 0,
+        "escrow sender must receive insurance payout"
+    );
+}
+
+#[test]
+#[should_panic(expected = "insufficient insurance fund balance")]
+fn test_insurance_payout_panics_when_fund_empty() {
+    // When the insurance fund holds zero balance, payout must panic.
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 500_0000000i128;
+
+    // Create and cancel an escrow without ever building the insurance fund.
+    let (sender, _, _, id) = make_escrow(&env, &client, &usdc_id, &admin, amount, 0);
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.cancel_escrow(&sender, &id);
+
+    // Insurance fund is empty (fee_bps = 0 → no contributions).
+    client.insurance_payout(&id);
+}
+
+#[test]
+fn test_insurance_payout_emits_insurance_payout_event() {
+    let (env, client, admin, usdc_id) = setup();
+    let amount = 800_0000000i128;
+    let fee_bps = 500u32;
+
+    // Build insurance fund.
+    let (_, _, agent_fund, id_fund) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    client.confirm_payout(&agent_fund, &id_fund);
+
+    // Create and cancel victim escrow.
+    let (sender_victim, _, _, id_victim) =
+        make_escrow(&env, &client, &usdc_id, &admin, amount, fee_bps);
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.cancel_escrow(&sender_victim, &id_victim);
+
+    client.insurance_payout(&id_victim);
+
+    let event_name: Val = Symbol::new(&env, "InsurancePayout").into_val(&env);
+    let events = env.events().all();
+    let evt = events.iter().find(|(_, topics, _)| {
+        topics.iter().any(|t| t == &event_name)
+    });
+    assert!(evt.is_some(), "InsurancePayout event must be emitted");
+
+    let (_, _, data) = evt.unwrap();
+    let payload: crate::InsurancePayout = soroban_sdk::from_val(&env, data);
+    assert_eq!(payload.escrow_id, id_victim);
+    assert_eq!(payload.recipient, sender_victim);
+    assert!(payload.amount > 0);
+}
 
 #[test]
 fn test_partial_confirm_payout_single_release() {
