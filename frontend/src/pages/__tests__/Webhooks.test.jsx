@@ -30,4 +30,17 @@ describe('Webhooks secret display', () => {
     await waitFor(() => expect(screen.getByText('abcd****')).toBeInTheDocument());
     expect(screen.queryByText(/^[a-f0-9]{64}$/)).not.toBeInTheDocument();
   });
+
+  test('does not render a plaintext secret returned by a list response', async () => {
+    api.get.mockResolvedValue({
+      data: {
+        webhooks: [{ ...webhook, secret: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' }],
+      },
+    });
+
+    render(<Webhooks />);
+
+    await waitFor(() => expect(screen.getByText('abcd****')).toBeInTheDocument());
+    expect(screen.queryByText(/^[a-f0-9]{64}$/)).not.toBeInTheDocument();
+  });
 });
